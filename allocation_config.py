@@ -4,11 +4,22 @@ import json
 import os
 import re
 
-# This module keeps the allocation/balance logic configurable without Streamlit.
+# ============================================================
+# Allocation / Balance configuration ONLY
+# ============================================================
+# This file intentionally does not affect Spend / Age / Governorate.
 
-DEFAULT_BUSINESS_IDS = [
+DEFAULT_ALLOCATION_BUSINESS_IDS = [
     "751488620224306",
     "1178859133269743",
+]
+
+# Keep Allocation aware of the same businesses used by the Smart reports.
+# This prevents valid agents/accounts from disappearing simply because they
+# live in REPORT_BUSINESS_IDS rather than the older Allocation scope.
+DEFAULT_REPORT_BUSINESS_IDS = [
+    "1935536750225128",
+    "751488620224306",
 ]
 
 MEDIA_BUYER_MAP = {
@@ -33,19 +44,52 @@ def _split_values(raw: str) -> list[str]:
     ]
 
 
-BUSINESS_IDS = _split_values(
-    os.getenv(
-        "ALLOCATION_BUSINESS_IDS",
-        ",".join(DEFAULT_BUSINESS_IDS),
-    )
-)
+def _dedupe(values: list[str]) -> list[str]:
+    output: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        value = str(value or "").strip()
+        if value and value not in seen:
+            seen.add(value)
+            output.append(value)
+    return output
 
-try:
-    OVERALL_ALLOCATION_BUDGET = float(
-        os.getenv("OVERALL_ALLOCATION_BUDGET", "0") or 0
-    )
-except ValueError:
-    OVERALL_ALLOCATION_BUDGET = 0.0
+
+# Allocation keeps its original Business IDs, but ALSO inherits the report
+# Business IDs. This changes only Allocation account discovery.
+_allocation_ids = _split_values(os.getenv("ALLOCATION_BUSINESS_IDS", ""))
+if not _allocation_ids:
+    _allocation_ids = DEFAULT_ALLOCATION_BUSINESS_IDS.copy()
+
+_report_ids = _split_values(os.getenv("REPORT_BUSINESS_IDS", ""))
+if not _report_ids:
+    _report_ids = DEFAULT_REPORT_BUSINESS_IDS.copy()
+
+BUSINESS_IDS = _dedupe(_allocation_ids + _report_ids)
+
+
+def _read_money_env(*names: str, default: float = 0.0) -> float:
+    """Read an allocation money value robustly from env.
+
+    Supports both OVERALL_ALLOCATION_BUDGET and the shorter ALLOCATION_BUDGET,
+    and accepts values such as 250000 or 250,000.
+    """
+    for name in names:
+        raw = os.getenv(name, "").strip()
+        if not raw:
+            continue
+        try:
+            return float(raw.replace(",", ""))
+        except ValueError:
+            continue
+    return float(default)
+
+
+OVERALL_ALLOCATION_BUDGET = _read_money_env(
+    "OVERALL_ALLOCATION_BUDGET",
+    "ALLOCATION_BUDGET",
+    default=0.0,
+)
 
 CRITICAL_COVERAGE_DAYS = 1.0
 TARGET_COVERAGE_DAYS = 3.0
@@ -103,9 +147,18 @@ def clean_account_id(value) -> str:
 def extract_buyer_code(account_name: str) -> str:
     text = normalize_text(account_name)
     for code in MEDIA_BUYER_MAP:
+        # Standard separated code: ...-AA-... / ... AA ...
         pattern = rf"(?<![A-Z0-9]){re.escape(code)}(?![A-Z0-9])"
         if re.search(pattern, text):
             return code
+
+    # Fallback for compact account naming such as AA01 / EK02 while keeping
+    # the match tied to a separator before the code.
+    for code in MEDIA_BUYER_MAP:
+        compact = rf"(?<![A-Z0-9]){re.escape(code)}(?=\d)"
+        if re.search(compact, text):
+            return code
+
     return "UNKNOWN"
 
 

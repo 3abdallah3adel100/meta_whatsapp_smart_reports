@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from typing import Any
 
@@ -32,6 +32,7 @@ class MetaClient:
     access_token: str
     api_version: str = "v26.0"
     timeout: int = 60
+    discovery_errors: list[str] = field(default_factory=list, init=False)
 
     def _get(self, path_or_url: str, params: dict[str, Any] | None = None) -> dict:
         url = path_or_url if path_or_url.startswith("http") else f"{BASE_URL}/{self.api_version}/{path_or_url.lstrip('/')}"
@@ -62,33 +63,70 @@ class MetaClient:
         return rows
 
     def get_ad_accounts(self) -> pd.DataFrame:
+        """Discover Allocation accounts without narrowing away valid agents.
+
+        Allocation now reads the UNION of ALLOCATION_BUSINESS_IDS and
+        REPORT_BUSINESS_IDS (prepared in allocation_config.py). Business-edge
+        accounts are always eligible. /me/adaccounts remains a supplemental
+        source and accepts either the known account prefixes OR a recognized
+        media-buyer code.
+        """
         frames: list[pd.DataFrame] = []
         sources: list[tuple[str, str, bool]] = []
+        self.discovery_errors = []
 
         if INCLUDE_ME_AD_ACCOUNTS:
             sources.append(("me/adaccounts", "me/adaccounts", True))
 
         for business_id in BUSINESS_IDS:
             sources.extend([
-                (f"business/{business_id}/owned", f"{business_id}/owned_ad_accounts", False),
-                (f"business/{business_id}/client", f"{business_id}/client_ad_accounts", False),
+                (
+                    f"business/{business_id}/owned",
+                    f"{business_id}/owned_ad_accounts",
+                    False,
+                ),
+                (
+                    f"business/{business_id}/client",
+                    f"{business_id}/client_ad_accounts",
+                    False,
+                ),
             ])
 
-        fields = "id,account_id,name,account_status,currency,balance,amount_spent,spend_cap,funding_source_details"
+        fields = (
+            "id,account_id,name,account_status,currency,balance,"
+            "amount_spent,spend_cap,funding_source_details"
+        )
+
         for source_name, endpoint, is_me in sources:
             try:
-                rows = self.fetch_all_pages(endpoint, {"fields": fields, "limit": 500})
-            except Exception:
+                rows = self.fetch_all_pages(
+                    endpoint,
+                    {"fields": fields, "limit": 500},
+                )
+            except Exception as exc:
+                self.discovery_errors.append(f"{source_name}: {exc}")
                 continue
+
             if not rows:
                 continue
+
             df = pd.DataFrame(rows)
             df["source"] = source_name
+
             if is_me and "name" in df.columns:
-                mask = df["name"].astype(str).str.upper().apply(
-                    lambda name: any(prefix in name for prefix in ME_ACCOUNT_NAME_PREFIXES)
-                )
-                df = df[mask].copy()
+                def _eligible_direct(name: str) -> bool:
+                    upper = str(name or "").upper()
+                    prefix_match = any(
+                        prefix in upper
+                        for prefix in ME_ACCOUNT_NAME_PREFIXES
+                    )
+                    buyer_match = extract_buyer_code(upper) != "UNKNOWN"
+                    return prefix_match or buyer_match
+
+                df = df[
+                    df["name"].astype(str).apply(_eligible_direct)
+                ].copy()
+
             if not df.empty:
                 frames.append(df)
 
@@ -98,11 +136,19 @@ class MetaClient:
         out = pd.concat(frames, ignore_index=True)
         if "id" not in out.columns:
             return pd.DataFrame()
-        out = out.sort_values(["name", "source"], na_position="last").drop_duplicates("id", keep="first")
+
+        if "name" not in out.columns:
+            out["name"] = out["id"].astype(str)
+
+        out = (
+            out.sort_values(["name", "source"], na_position="last")
+            .drop_duplicates("id", keep="first")
+            .reset_index(drop=True)
+        )
         out["clean_account_id"] = out["id"].map(clean_account_id)
         out["buyer_code"] = out["name"].map(extract_buyer_code)
         out["media_buyer"] = out["buyer_code"].map(buyer_name)
-        return out.reset_index(drop=True)
+        return out
 
     def get_campaigns(self, account_id: str) -> pd.DataFrame:
         clean_id = clean_account_id(account_id)
@@ -326,6 +372,72 @@ def calculate_account_daily_budget(
     return total, details, warnings
 
 
+def _spend_map_from_breakdown(
+    df: pd.DataFrame,
+    id_column: str,
+) -> dict[str, float]:
+    """Convert account-level Insights breakdown rows into {entity_id: spend}."""
+    if df.empty or id_column not in df.columns or "spend" not in df.columns:
+        return {}
+
+    work = df[[id_column, "spend"]].copy()
+    work[id_column] = work[id_column].astype(str)
+    work["spend"] = pd.to_numeric(work["spend"], errors="coerce").fillna(0.0)
+    work = work[work[id_column].str.strip() != ""]
+    if work.empty:
+        return {}
+
+    grouped = work.groupby(id_column, as_index=False)["spend"].sum()
+    return {
+        str(row[id_column]): float(row["spend"])
+        for _, row in grouped.iterrows()
+    }
+
+
+def _account_breakdown_spend_maps(
+    client: MetaClient,
+    account_id: str,
+    today: date | None = None,
+) -> tuple[dict[str, float], dict[str, float], list[str]]:
+    """Get Campaign + Ad Set spend from the AD ACCOUNT insights endpoint.
+
+    This is substantially more reliable than calling /{campaign_id}/insights and
+    /{adset_id}/insights one-by-one. It also avoids the old behavior where a
+    permission/error on an entity was silently converted to spend=0.
+    """
+    errors: list[str] = []
+    campaign_map: dict[str, float] = {}
+    adset_map: dict[str, float] = {}
+
+    try:
+        campaign_df = client.get_today_spend_breakdown(
+            account_id,
+            "campaign",
+            today=today,
+        )
+        campaign_map = _spend_map_from_breakdown(
+            campaign_df,
+            "campaign_id",
+        )
+    except Exception as exc:
+        errors.append(f"campaign breakdown: {exc}")
+
+    try:
+        adset_df = client.get_today_spend_breakdown(
+            account_id,
+            "adset",
+            today=today,
+        )
+        adset_map = _spend_map_from_breakdown(
+            adset_df,
+            "adset_id",
+        )
+    except Exception as exc:
+        errors.append(f"adset breakdown: {exc}")
+
+    return campaign_map, adset_map, errors
+
+
 def _entity_spend_map(
     client: MetaClient,
     entities: pd.DataFrame,
@@ -389,17 +501,21 @@ def _entity_spend_map(
 
     return result
 
-def fetch_account_snapshot(client: MetaClient, account_row: pd.Series, spend_date: date | None = None) -> dict:
+def fetch_account_snapshot(
+    client: MetaClient,
+    account_row: pd.Series,
+    spend_date: date | None = None,
+) -> dict:
     account_id = clean_account_id(account_row.get("id"))
     account_name = str(account_row.get("name") or account_id)
     currency = str(account_row.get("currency") or "EGP").upper()
     buyer_code = extract_buyer_code(account_name)
 
     try:
-        # Spend-first gate: if the account did not spend today, do NOT fetch
-        # campaigns/ad sets for budget calculations. This removes no-fund / idle
-        # active campaigns from the daily-budget report entirely.
-        spend_today = client.get_today_spend(account_id, today=spend_date)
+        spend_today = client.get_today_spend(
+            account_id,
+            today=spend_date,
+        )
         balance, balance_source = get_available_balance(account_row)
 
         if spend_today <= 0:
@@ -410,7 +526,7 @@ def fetch_account_snapshot(client: MetaClient, account_row: pd.Series, spend_dat
                 "buyer_code": buyer_code,
                 "media_buyer": buyer_name(buyer_code),
                 "spend_today": 0.0,
-                "active_daily_budget": 0.0,  # legacy column name; means spending daily budget
+                "active_daily_budget": 0.0,
                 "balance": balance,
                 "balance_source": balance_source,
                 "coverage_days": None,
@@ -421,30 +537,76 @@ def fetch_account_snapshot(client: MetaClient, account_row: pd.Series, spend_dat
                 "error": None,
             }
 
-        # Fetch BOTH levels every time the account has spend. This mirrors the
-        # working Google Sheets script and prevents Ad Set budgets from being skipped.
         campaigns = client.get_campaigns(account_id)
         adsets = client.get_adsets(account_id)
 
-        # Direct entity-level spend checks are intentionally used here instead of
-        # deciding ABO/CBO first. Campaign and Ad Set budgets are evaluated independently.
-        campaign_spend_by_id = _entity_spend_map(client, campaigns, today=spend_date)
-        adset_spend_by_id = _entity_spend_map(client, adsets, today=spend_date)
+        # PRIMARY METHOD: one account-level Insights request per breakdown.
+        # This works with the same Ad Account permissions already proven by the
+        # working Spend/Age/Governorate reports.
+        (
+            campaign_spend_by_id,
+            adset_spend_by_id,
+            lookup_errors,
+        ) = _account_breakdown_spend_maps(
+            client,
+            account_id,
+            today=spend_date,
+        )
 
-        daily_budget, budget_details, warnings = calculate_account_daily_budget(
+        warnings: list[str] = list(lookup_errors)
+
+        # FALLBACK: preserve the previous direct entity method only when the
+        # account has spend but the account-breakdown map could not be built.
+        if campaigns is not None and not campaigns.empty and not campaign_spend_by_id:
+            fallback_campaign = _entity_spend_map(
+                client,
+                campaigns,
+                today=spend_date,
+            )
+            if fallback_campaign:
+                campaign_spend_by_id = fallback_campaign
+                warnings.append("campaign spend used legacy entity fallback")
+
+        if adsets is not None and not adsets.empty and not adset_spend_by_id:
+            fallback_adset = _entity_spend_map(
+                client,
+                adsets,
+                today=spend_date,
+            )
+            if fallback_adset:
+                adset_spend_by_id = fallback_adset
+                warnings.append("adset spend used legacy entity fallback")
+
+        (
+            daily_budget,
+            budget_details,
+            budget_warnings,
+        ) = calculate_account_daily_budget(
             campaigns,
             adsets,
             campaign_spend_by_id,
             adset_spend_by_id,
             currency,
         )
+        warnings.extend(budget_warnings)
+
+        # Surface suspicious zero-budget cases in Actions logs instead of silently
+        # making the agent disappear from Allocation.
+        if spend_today > 0 and daily_budget <= 0:
+            warnings.append(
+                "Spend Today > 0 but no spending Campaign/Ad Set with daily_budget was found."
+            )
 
         coverage_days = None
         if balance is not None and daily_budget > 0:
             coverage_days = balance / daily_budget
+
         required_for_3_days = None
         if balance is not None and daily_budget > 0:
-            required_for_3_days = max(0.0, daily_budget * 3.0 - balance)
+            required_for_3_days = max(
+                0.0,
+                daily_budget * 3.0 - balance,
+            )
 
         return {
             "account_id": account_id,
@@ -453,7 +615,7 @@ def fetch_account_snapshot(client: MetaClient, account_row: pd.Series, spend_dat
             "buyer_code": buyer_code,
             "media_buyer": buyer_name(buyer_code),
             "spend_today": spend_today,
-            "active_daily_budget": daily_budget,  # legacy column name; means spending daily budget
+            "active_daily_budget": daily_budget,
             "balance": balance,
             "balance_source": balance_source,
             "coverage_days": coverage_days,
@@ -463,6 +625,7 @@ def fetch_account_snapshot(client: MetaClient, account_row: pd.Series, spend_dat
             "warnings": warnings,
             "error": None,
         }
+
     except Exception as exc:
         return {
             "account_id": account_id,
