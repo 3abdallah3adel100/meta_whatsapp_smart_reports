@@ -8,6 +8,12 @@ on:
         required: true
         type: string
 
+      team_key:
+        description: "taher | cairo"
+        required: true
+        default: "taher"
+        type: string
+
       agent_code:
         description: "ALL | AA | HM | BM | EK | MA | AF | SQ | OS | MM | NB"
         required: true
@@ -74,6 +80,7 @@ jobs:
         run: |
           python smart_report.py \
             --range "${{ inputs.range_key }}" \
+            --team "${{ inputs.team_key }}" \
             --agent "${{ inputs.agent_code }}" \
             --reports "${{ inputs.report_types }}" \
             --recipient "${{ inputs.recipient }}" \
