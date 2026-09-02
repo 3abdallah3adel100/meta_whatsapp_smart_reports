@@ -47,7 +47,7 @@ from allocation_meta import fetch_full_snapshot
 
 
 BASE_URL = "https://graph.facebook.com"
-REPORT_BUILD = "2026-09-02-SMART-FLEX-REPORTS-V1"
+REPORT_BUILD = "2026-09-02-SMART-FLEX-REPORTS-V2-CAIRO-TEAM"
 
 TEAM_BUSINESS_IDS = OrderedDict([
     ("Cairo Team", "1935536750225128"),
@@ -139,6 +139,12 @@ def load_config(recipient: str, dry_run: bool = False) -> Config:
             ",".join(default_business_ids),
         )
     )
+
+    # Team commands must always be able to reach both known businesses.
+    # This does not change Taher filtering; it only guarantees Cairo is discoverable.
+    for known_id in default_business_ids:
+        if known_id not in configured_ids:
+            configured_ids.append(known_id)
 
     return Config(
         meta_access_token=require_env("META_ACCESS_TOKEN"),
@@ -403,10 +409,43 @@ def normalize_agent_code(value: str) -> str:
     raise ValueError(f"Unsupported agent: {value}")
 
 
+def normalize_team_key(value: str) -> str:
+    raw = str(value or "").strip().lower()
+
+    if raw in {
+        "", "taher", "taher team", "team taher",
+        "طاهر", "تيم طاهر", "تييم طاهر",
+    }:
+        return "taher"
+
+    if raw in {
+        "cairo", "cairo team", "team cairo",
+        "qaoud", "kaoud", "qaaoud",
+        "القاهرة", "القاهره", "قاهرة", "قاهره",
+        "قاعود", "تيم القاهرة", "تييم القاهرة",
+        "تيم قاعود", "تييم قاعود",
+    }:
+        return "cairo"
+
+    raise ValueError(f"Unsupported team: {value}")
+
+
+def team_label(team_key: str) -> str:
+    if team_key == "cairo":
+        return "Cairo Team (Qaoud)"
+    return "Taher Team"
+
+
 def scope_label(agent_code: str) -> str:
     if agent_code == "ALL":
         return "All Agents"
     return f"{buyer_name(agent_code)} ({agent_code})"
+
+
+def request_scope_label(team_key: str, agent_code: str) -> str:
+    if team_key == "cairo":
+        return "Cairo Team (Qaoud) — Overall"
+    return scope_label(agent_code)
 
 
 # ============================================================
@@ -722,13 +761,19 @@ def get_report_accounts(
         if not account_id:
             continue
 
-        if account_id not in dedup:
+        # Keep the same account separately when it belongs to two different
+        # Business IDs/teams, while still deduping owned/client duplicates
+        # inside the same team.
+        team_name = str(row.get("_team") or "Generic Team")
+        dedup_key = f"{team_name}:{account_id}"
+
+        if dedup_key not in dedup:
             item = dict(row)
             item["id"] = f"act_{account_id}"
             item["buyer_code"] = extract_buyer_code(
                 str(item.get("name", ""))
             )
-            dedup[account_id] = item
+            dedup[dedup_key] = item
 
     accounts = list(dedup.values())
     accounts.sort(
@@ -746,6 +791,23 @@ def get_report_accounts(
         )
 
     return accounts, errors
+
+
+def filter_accounts_for_team(
+    accounts: list[dict[str, Any]],
+    team_key: str,
+) -> list[dict[str, Any]]:
+    wanted = (
+        "Cairo Team"
+        if team_key == "cairo"
+        else "Taher Team"
+    )
+
+    return [
+        account
+        for account in accounts
+        if str(account.get("_team") or "") == wanted
+    ]
 
 
 def filter_accounts_for_agent(
@@ -905,25 +967,36 @@ def fetch_account_report_data(
 def fetch_report_data(
     config: Config,
     period: Period,
+    team_key: str,
     agent_code: str,
     report_types: list[str],
 ) -> tuple[list[dict[str, Any]], list[str]]:
     accounts, discovery_errors = get_report_accounts(
         config
     )
-    accounts = filter_accounts_for_agent(
+
+    accounts = filter_accounts_for_team(
         accounts,
-        agent_code,
+        team_key,
     )
+
+    # Taher keeps the existing agent behavior exactly.
+    # Cairo/Qaoud is always Overall and is never split by agent.
+    if team_key == "taher":
+        accounts = filter_accounts_for_agent(
+            accounts,
+            agent_code,
+        )
 
     if not accounts:
         raise RuntimeError(
-            f"No Ad Accounts found for {scope_label(agent_code)}."
+            f"No Ad Accounts found for {request_scope_label(team_key, agent_code)}."
         )
 
     print(
         f"Report accounts: {len(accounts)} "
-        f"| Scope={scope_label(agent_code)}"
+        f"| Team={team_label(team_key)} "
+        f"| Scope={request_scope_label(team_key, agent_code)}"
     )
 
     results: list[dict[str, Any]] = []
@@ -1493,6 +1566,184 @@ def build_governorate_report(
     return "\n".join(lines).strip()
 
 
+
+# ============================================================
+# Cairo / Qaoud report builders
+# ============================================================
+# These are intentionally separate from the Taher builders above so the
+# existing Taher message structure and agent logic remain untouched.
+
+def build_cairo_spend_report(
+    period: Period,
+    metrics: dict[str, Any],
+    generated_at: datetime,
+) -> str:
+    total_spend = to_float(metrics.get("spend"))
+    total_leads = to_float(metrics.get("leads"))
+    male_details = metrics.get("male_details", [])
+
+    lines = [
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"📊 *CAIRO TEAM — {period.label.upper()} PERFORMANCE*",
+        "🏢 *Cairo Team (Qaoud) — Overall*",
+        f"🗓 {date_line(period)}",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        f"💰 Spend: *{money(total_spend)}*",
+        f"🎯 Leads: *{leads_text(total_leads)}*",
+        f"📉 CPL: *{cpl_text(total_spend, total_leads)}*",
+        "",
+        "👨 *MALE SPEND*",
+    ]
+
+    if not male_details:
+        lines.append("✅ No Male Spend detected")
+    else:
+        total_male = sum(
+            to_float(row.get("spend"))
+            for row in male_details
+        )
+        lines.append(
+            f"⚠️ Total Male Spend: *{money(total_male)}*"
+        )
+
+        for index, row in enumerate(male_details, 1):
+            lines.extend([
+                "",
+                f"*Male Alert #{index}*",
+                f"Spend: {money(row.get('spend'))}",
+                f"Account: {row.get('account_name', '-')}",
+                f"ID: {row.get('account_id', '-')}",
+            ])
+
+    errors = metrics.get("errors", [])
+    if errors:
+        lines.extend([
+            "",
+            f"⚠️ Data warnings: {len(errors)}",
+        ])
+
+    lines.extend([
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"⏱ {generated_at.strftime('%Y-%m-%d %H:%M:%S')} Cairo",
+    ])
+
+    return "\n".join(lines).strip()
+
+
+def build_cairo_age_report(
+    period: Period,
+    metrics: dict[str, Any],
+    generated_at: datetime,
+) -> str:
+    age_map = metrics.get("age", {})
+    total_spend = to_float(metrics.get("spend"))
+    total_leads = to_float(metrics.get("leads"))
+
+    lines = [
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"👥 *CAIRO TEAM — AGE REPORT — {period.label}*",
+        "🏢 *Cairo Team (Qaoud) — Overall*",
+        f"🗓 {date_line(period)}",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        f"💰 Total Spend: *{money(total_spend)}*",
+        f"🎯 Total Leads: *{leads_text(total_leads)}*",
+        f"📉 Overall CPL: *{cpl_text(total_spend, total_leads)}*",
+        "",
+    ]
+
+    for bucket in ordered_age_buckets(age_map):
+        row = age_map.get(
+            bucket,
+            {"spend": 0.0, "leads": 0.0},
+        )
+        spend = to_float(row.get("spend"))
+        leads = to_float(row.get("leads"))
+
+        lines.extend([
+            f"🔹 *{bucket}*",
+            f"Spend: {money(spend)}",
+            f"Leads: {leads_text(leads)}",
+            f"CPL: {cpl_text(spend, leads)}",
+            f"Share: {percentage_text(spend, total_spend)}",
+            "",
+        ])
+
+    errors = metrics.get("errors", [])
+    if errors:
+        lines.append(f"⚠️ Data warnings: {len(errors)}")
+
+    lines.extend([
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"⏱ {generated_at.strftime('%Y-%m-%d %H:%M:%S')} Cairo",
+    ])
+
+    return "\n".join(lines).strip()
+
+
+def build_cairo_governorate_report(
+    period: Period,
+    metrics: dict[str, Any],
+    generated_at: datetime,
+) -> str:
+    regions = metrics.get("regions", {})
+    total_spend = to_float(metrics.get("spend"))
+    total_leads = to_float(metrics.get("leads"))
+
+    sorted_regions = sorted(
+        regions.items(),
+        key=lambda item: (
+            -to_float(item[1].get("spend")),
+            item[0].casefold(),
+        ),
+    )
+
+    lines = [
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"🗺️ *CAIRO TEAM — GOVERNORATE REPORT — {period.label}*",
+        "🏢 *Cairo Team (Qaoud) — Overall*",
+        f"🗓 {date_line(period)}",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        f"💰 Total Spend: *{money(total_spend)}*",
+        f"🎯 Total Leads: *{leads_text(total_leads)}*",
+        f"📉 Overall CPL: *{cpl_text(total_spend, total_leads)}*",
+        "",
+    ]
+
+    if not sorted_regions:
+        lines.append("No governorate data returned.")
+    else:
+        for index, (region, row) in enumerate(
+            sorted_regions,
+            1,
+        ):
+            spend = to_float(row.get("spend"))
+            leads = to_float(row.get("leads"))
+
+            lines.extend([
+                f"*{index}. {region}*",
+                f"Spend: {money(spend)}",
+                f"Leads: {leads_text(leads)}",
+                f"CPL: {cpl_text(spend, leads)}",
+                f"Share: {percentage_text(spend, total_spend)}",
+                "",
+            ])
+
+    errors = metrics.get("errors", [])
+    if errors:
+        lines.append(f"⚠️ Data warnings: {len(errors)}")
+
+    lines.extend([
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"⏱ {generated_at.strftime('%Y-%m-%d %H:%M:%S')} Cairo",
+    ])
+
+    return "\n".join(lines).strip()
+
+
 # ============================================================
 # Allocation report (same core logic as reference project)
 # ============================================================
@@ -1905,11 +2156,246 @@ def build_allocation_recharge(
     return "\n".join(lines).strip()
 
 
+
+def get_cairo_allocation_accounts(
+    client: AllocationMetaClient,
+) -> pd.DataFrame:
+    """Load Cairo/Qaoud accounts only for Allocation.
+
+    This uses the same Allocation Meta client and budget logic as Taher, but
+    the account discovery is restricted to the Cairo Business ID so Taher data
+    cannot leak into a Cairo request.
+    """
+    business_id = TEAM_BUSINESS_IDS["Cairo Team"]
+    rows: list[dict[str, Any]] = []
+
+    fields = (
+        "id,account_id,name,account_status,currency,"
+        "balance,amount_spent,spend_cap,funding_source_details,"
+        "timezone_name,timezone_offset_hours_utc"
+    )
+
+    errors: list[str] = []
+
+    for edge in ("owned_ad_accounts", "client_ad_accounts"):
+        try:
+            part = client.fetch_all_pages(
+                f"{business_id}/{edge}",
+                {
+                    "fields": fields,
+                    "limit": 500,
+                },
+            )
+            rows.extend(part)
+        except Exception as exc:
+            errors.append(f"{business_id}/{edge}: {exc}")
+
+    if errors:
+        for error in errors:
+            print(f"WARNING Cairo Allocation discovery: {error}")
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+
+    if "id" not in df.columns:
+        return pd.DataFrame()
+
+    if "name" not in df.columns:
+        df["name"] = df["id"].astype(str)
+
+    if "currency" not in df.columns:
+        df["currency"] = "EGP"
+
+    df = (
+        df.sort_values(
+            [col for col in ["name", "id"] if col in df.columns]
+        )
+        .drop_duplicates("id", keep="first")
+        .reset_index(drop=True)
+    )
+
+    return df
+
+
+def build_cairo_allocation_report(
+    snapshot_df: pd.DataFrame,
+    generated_at: datetime,
+) -> str:
+    allocation = float(OVERALL_ALLOCATION_BUDGET)
+
+    total_spend = (
+        pd.to_numeric(
+            snapshot_df.get(
+                "spend_today",
+                pd.Series(dtype=float),
+            ),
+            errors="coerce",
+        ).fillna(0).sum()
+        if not snapshot_df.empty
+        else 0.0
+    )
+
+    total_daily = (
+        pd.to_numeric(
+            snapshot_df.get(
+                "active_daily_budget",
+                pd.Series(dtype=float),
+            ),
+            errors="coerce",
+        ).fillna(0).sum()
+        if not snapshot_df.empty
+        else 0.0
+    )
+
+    total_balance = (
+        pd.to_numeric(
+            snapshot_df.get(
+                "balance",
+                pd.Series(dtype=float),
+            ),
+            errors="coerce",
+        ).fillna(0).sum()
+        if not snapshot_df.empty
+        else 0.0
+    )
+
+    spend_vs_allocation = safe_ratio_pct(
+        total_spend,
+        allocation,
+    )
+    remaining_allocation = (
+        allocation - total_spend
+        if allocation > 0
+        else None
+    )
+
+    lines = [
+        "━━━━━━━━━━━━━━━━━━━━",
+        "💰 *CAIRO TEAM — ALLOCATION REPORT*",
+        "🏢 *Cairo Team (Qaoud) — Overall*",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        f"Spend Today: *{money(total_spend)}*",
+        f"Daily Budget: *{money(total_daily)}*",
+        f"Overall Balance: *{money(total_balance)}*",
+        (
+            f"Allocation Budget: *{money(allocation)}*"
+            if allocation > 0
+            else "Allocation Budget: *NOT CONFIGURED*"
+        ),
+        f"Spend vs Allocation: *{pct(spend_vs_allocation)}*",
+        (
+            f"Remaining Allocation: *{money(remaining_allocation)}*"
+            if remaining_allocation is not None
+            else "Remaining Allocation: *N/A*"
+        ),
+        f"Note: {build_allocation_note(total_daily, allocation)}",
+        "",
+        "📂 *AD ACCOUNTS*",
+    ]
+
+    if snapshot_df.empty:
+        lines.append("No Cairo Ad Account data found.")
+    else:
+        visible = snapshot_df.copy()
+        visible["_daily"] = pd.to_numeric(
+            visible.get(
+                "active_daily_budget",
+                pd.Series(index=visible.index, dtype=float),
+            ),
+            errors="coerce",
+        ).fillna(0)
+        visible["_spend"] = pd.to_numeric(
+            visible.get(
+                "spend_today",
+                pd.Series(index=visible.index, dtype=float),
+            ),
+            errors="coerce",
+        ).fillna(0)
+
+        visible = visible.sort_values(
+            ["_daily", "_spend", "account_name"],
+            ascending=[False, False, True],
+        )
+
+        for _, row in visible.iterrows():
+            daily = to_float(row.get("active_daily_budget"))
+            spend = to_float(row.get("spend_today"))
+            balance = row.get("balance")
+            coverage = row.get("coverage_days")
+            currency = str(row.get("currency") or "EGP")
+
+            # Keep the message useful without any agent grouping.
+            if daily <= 0 and spend <= 0:
+                continue
+
+            lines.extend([
+                "",
+                f"*{row.get('account_name', row.get('account_id', '-'))}*",
+                f"ID: {row.get('account_id', '-')}",
+                f"Spend Today: {money(spend, currency)}",
+                f"Daily Budget: {money(daily, currency)}",
+                f"Balance: {money(balance, currency)}",
+                f"Coverage: {days_text(coverage)}",
+            ])
+
+    lines.extend([
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"⏱ {generated_at.strftime('%Y-%m-%d %H:%M:%S')} Cairo",
+    ])
+
+    return "\n".join(lines).strip()
+
+
 def build_allocation_messages(
     config: Config,
     agent_code: str,
     generated_at: datetime,
+    team_key: str = "taher",
 ) -> list[tuple[str, str]]:
+    if team_key == "cairo":
+        print(
+            "Fetching current Cairo Allocation / Balance snapshot..."
+        )
+
+        cairo_client = AllocationMetaClient(
+            access_token=config.meta_access_token,
+            api_version=config.api_version,
+        )
+
+        cairo_accounts = get_cairo_allocation_accounts(
+            cairo_client
+        )
+
+        if cairo_accounts.empty:
+            raise RuntimeError(
+                "Cairo Allocation returned no eligible accounts."
+            )
+
+        cairo_snapshot, _details = fetch_full_snapshot(
+            cairo_client,
+            cairo_accounts,
+            max_workers=config.max_workers,
+            spend_date=generated_at.date(),
+        )
+
+        if cairo_snapshot.empty:
+            raise RuntimeError(
+                "Cairo Allocation snapshot is empty."
+            )
+
+        return [(
+            "Cairo Allocation",
+            build_cairo_allocation_report(
+                cairo_snapshot,
+                generated_at,
+            ),
+        )]
+
+    # Taher Allocation path below is intentionally unchanged.
     print(
         "Fetching current Allocation / Balance snapshot..."
     )
@@ -2067,6 +2553,7 @@ def send_report_messages(
 def build_requested_messages(
     config: Config,
     period: Period,
+    team_key: str,
     agent_code: str,
     report_types: list[str],
     generated_at: datetime,
@@ -2086,6 +2573,7 @@ def build_requested_messages(
         account_results, _errors = fetch_report_data(
             config,
             period,
+            team_key,
             agent_code,
             meta_types,
         )
@@ -2094,42 +2582,72 @@ def build_requested_messages(
         metrics = aggregate_spend(
             account_results
         )
-        messages.append((
-            "Spend",
-            build_spend_report(
+
+        if team_key == "cairo":
+            spend_message = build_cairo_spend_report(
+                period,
+                metrics,
+                generated_at,
+            )
+        else:
+            spend_message = build_spend_report(
                 period,
                 agent_code,
                 metrics,
                 generated_at,
-            ),
+            )
+
+        messages.append((
+            "Spend",
+            spend_message,
         ))
 
     if "age" in report_types:
         metrics = aggregate_age(
             account_results
         )
-        messages.append((
-            "Age",
-            build_age_report(
+
+        if team_key == "cairo":
+            age_message = build_cairo_age_report(
+                period,
+                metrics,
+                generated_at,
+            )
+        else:
+            age_message = build_age_report(
                 period,
                 agent_code,
                 metrics,
                 generated_at,
-            ),
+            )
+
+        messages.append((
+            "Age",
+            age_message,
         ))
 
     if "governorate" in report_types:
         metrics = aggregate_governorate(
             account_results
         )
-        messages.append((
-            "Governorate",
-            build_governorate_report(
+
+        if team_key == "cairo":
+            governorate_message = build_cairo_governorate_report(
+                period,
+                metrics,
+                generated_at,
+            )
+        else:
+            governorate_message = build_governorate_report(
                 period,
                 agent_code,
                 metrics,
                 generated_at,
-            ),
+            )
+
+        messages.append((
+            "Governorate",
+            governorate_message,
         ))
 
     if "allocation" in report_types:
@@ -2138,6 +2656,7 @@ def build_requested_messages(
                 config,
                 agent_code,
                 generated_at,
+                team_key=team_key,
             )
         )
 
@@ -2155,6 +2674,10 @@ def parse_args() -> argparse.Namespace:
         "--range",
         dest="range_value",
         required=True,
+    )
+    parser.add_argument(
+        "--team",
+        default="taher",
     )
     parser.add_argument(
         "--agent",
@@ -2183,9 +2706,18 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
+    team_key = normalize_team_key(
+        args.team
+    )
+
     agent_code = normalize_agent_code(
         args.agent
     )
+
+    # Cairo/Qaoud is intentionally Overall only.
+    if team_key == "cairo":
+        agent_code = "ALL"
+
     report_types = parse_report_types(
         args.reports
     )
@@ -2205,7 +2737,8 @@ def main() -> int:
     print(f"Build: {REPORT_BUILD}")
     print(f"Command: {args.raw_command}")
     print(f"Range: {period.label}")
-    print(f"Scope: {scope_label(agent_code)}")
+    print(f"Team: {team_label(team_key)}")
+    print(f"Scope: {request_scope_label(team_key, agent_code)}")
     print(f"Reports: {', '.join(report_types)}")
     print(
         f"Recipient: {mask_phone(config.recipient)}"
@@ -2215,6 +2748,7 @@ def main() -> int:
     messages = build_requested_messages(
         config,
         period,
+        team_key,
         agent_code,
         report_types,
         generated_at,
@@ -2248,7 +2782,7 @@ def main() -> int:
             "━━━━━━━━━━━━━━━━━━━━",
             "✅ *REQUEST COMPLETED*",
             f"Reports sent: {len(messages)}",
-            f"Scope: {scope_label(agent_code)}",
+            f"Scope: {request_scope_label(team_key, agent_code)}",
             "━━━━━━━━━━━━━━━━━━━━",
         ])
         send_whatsapp(config, completion)

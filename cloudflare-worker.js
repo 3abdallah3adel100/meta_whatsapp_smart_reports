@@ -217,6 +217,48 @@ const AGENTS = {
   },
 };
 
+
+const TEAMS = {
+  taher: {
+    label: "Taher Team",
+    aliases: [
+      "taher",
+      "taher team",
+      "team taher",
+      "طاهر",
+      "تيم طاهر",
+      "تييم طاهر",
+      "فريق طاهر",
+    ],
+  },
+  cairo: {
+    label: "Cairo Team (Qaoud)",
+    aliases: [
+      "cairo",
+      "cairo team",
+      "team cairo",
+      "qaoud",
+      "kaoud",
+      "qaaoud",
+      "qaoud team",
+      "القاهره",
+      "القاهرة",
+      "قاهره",
+      "قاهرة",
+      "قاعود",
+      "تيم القاهره",
+      "تيم القاهرة",
+      "تييم القاهره",
+      "تييم القاهرة",
+      "تيم قاعود",
+      "تييم قاعود",
+      "فريق القاهره",
+      "فريق القاهرة",
+      "فريق قاعود",
+    ],
+  },
+};
+
 const REPORT_TYPES = {
   spend: {
     label: "Spend / Performance",
@@ -430,6 +472,24 @@ function firstRange(text) {
 }
 
 
+
+function findTeams(text) {
+  const normalized = normalizeText(text);
+  const found = [];
+
+  for (const [key, config] of Object.entries(TEAMS)) {
+    const matched = config.aliases.some(
+      (alias) => phrasePresent(normalized, alias)
+    );
+
+    if (matched) {
+      found.push(key);
+    }
+  }
+
+  return [...new Set(found)];
+}
+
 function findAgents(text) {
   const normalized = normalizeText(text);
   const found = [];
@@ -508,9 +568,17 @@ function parseCommand(input) {
   }
 
   const range = firstRange(text);
+  const teams = findTeams(text);
   const agents = findAgents(text);
   const reportSelection = findReportTypes(text);
   const explicitAll = isExplicitAllAgents(text);
+
+  if (teams.length > 1) {
+    return {
+      type: "invalid",
+      reason: "multiple_teams",
+    };
+  }
 
   if (agents.length > 1) {
     return {
@@ -519,16 +587,29 @@ function parseCommand(input) {
     };
   }
 
+  // Default team is Taher unless Cairo/Qaoud is explicitly requested.
+  const teamKey = (
+    teams.length === 1
+      ? teams[0]
+      : "taher"
+  );
+
+  // Cairo/Qaoud is an OVERALL team and is not split by agent.
   const agentCode = (
-    agents.length === 1
-      ? agents[0]
-      : "ALL"
+    teamKey === "cairo"
+      ? "ALL"
+      : (
+          agents.length === 1
+            ? agents[0]
+            : "ALL"
+        )
   );
 
   let reportTypes = reportSelection.types;
 
   const recognizedAnything = (
     range.matched ||
+    teams.length > 0 ||
     agents.length > 0 ||
     reportSelection.matched ||
     explicitAll
@@ -541,7 +622,7 @@ function parseCommand(input) {
     };
   }
 
-  // If the user only selects a date or an agent,
+  // If the user only selects a date/team/agent,
   // the normal/default report is Spend.
   if (reportTypes.length === 0) {
     reportTypes = ["spend"];
@@ -551,11 +632,17 @@ function parseCommand(input) {
     type: "report",
     rangeKey: range.key,
     rangeLabel: range.label,
+    teamKey,
+    teamLabel: TEAMS[teamKey].label,
     agentCode,
     agentLabel: (
-      agentCode === "ALL"
-        ? "All Agents"
-        : `${AGENTS[agentCode].name} (${agentCode})`
+      teamKey === "cairo"
+        ? "Overall — no agent split"
+        : (
+            agentCode === "ALL"
+              ? "All Agents"
+              : `${AGENTS[agentCode].name} (${agentCode})`
+          )
     ),
     reportTypes,
     reportLabels: reportTypes.map(
@@ -565,10 +652,13 @@ function parseCommand(input) {
   };
 }
 
-
 function menuText() {
   return [
     "📊 *SMART META ADS REPORTS*",
+    "",
+    "🏢 *Team*",
+    "• Taher — Default لو مذكرتش Team",
+    "• Cairo / Qaoud — تييم القاهرة / تييم قاعود",
     "",
     "📅 *Range*",
     "1. Today",
@@ -585,7 +675,7 @@ function menuText() {
     "• Allocation — Budget / Balance / Coverage",
     "• Full — كل التقارير",
     "",
-    "👤 *Agents*",
+    "👤 *Taher Agents*",
     "AA — Abdallah Adel",
     "HM — Ahmed Hesham",
     "BM — Bassem Shalawy",
@@ -597,24 +687,29 @@ function menuText() {
     "MM — Mohamed Mahmoud",
     "NB — Mohamed Nabih",
     "",
+    "ℹ️ *Cairo / Qaoud*",
+    "التقرير Overall فقط ومش متقسم Agents.",
+    "",
     "✅ *Examples*",
-    "3 EK Age",
-    "7day - Esraa - Age",
     "Today AA",
-    "Allocation",
-    "3 EK Age Government",
-    "Full AA",
+    "7day EK Age",
+    "Today Cairo",
+    "7day Qaoud Age",
+    "3 Cairo Government",
+    "Full Cairo",
     "",
     "🇪🇬 وتقدر تكتب طبيعي:",
+    "عايز تقرير صرف انهاردة",
     "عايز تقرير لعبدالله انهاردة للصرف وال AGE",
-    "عايز المحافظات لاسراء اخر 7 ايام",
-    "عايز الالوكيشن بتاع كل الناس",
+    "عايز تقرير صرف انهاردة للقاهرة",
+    "عايز السن لقاعود اخر 7 ايام",
+    "عايز المحافظات لتييم القاهرة الشهر ده",
     "",
-    "لو من غير Agent → التقرير لكل الناس.",
+    "لو مذكرتش Team → Taher تلقائي.",
+    "لو Cairo/Qaoud → Overall بدون Agents.",
     "لو من غير Report Type → Spend تلقائي.",
   ].join("\n");
 }
-
 
 function allowedNumbers(env) {
   const raw = String(env.ALLOWED_NUMBERS || "").trim();
@@ -645,10 +740,19 @@ function reportSummary(command) {
   const lines = [
     "⏳ *جاري تجهيز التقرير...*",
     "",
+    `🏢 ${command.teamLabel}`,
     `📅 ${command.rangeLabel}`,
-    `👤 ${command.agentLabel}`,
-    `📑 ${command.reportLabels.join(" + ")}`,
   ];
+
+  if (command.teamKey === "taher") {
+    lines.push(`👤 ${command.agentLabel}`);
+  } else {
+    lines.push("📊 Overall — بدون تقسيم Agents");
+  }
+
+  lines.push(
+    `📑 ${command.reportLabels.join(" + ")}`
+  );
 
   if (
     command.reportTypes.includes("allocation") &&
@@ -667,7 +771,6 @@ function reportSummary(command) {
 
   return lines.join("\n");
 }
-
 
 async function sendWhatsAppText(env, to, body) {
   const apiVersion = env.META_API_VERSION || "v26.0";
@@ -730,6 +833,7 @@ async function dispatchGitHub(env, command, sender) {
       ref,
       inputs: {
         range_key: command.rangeKey,
+        team_key: command.teamKey,
         agent_code: command.agentCode,
         report_types: command.reportTypes.join(","),
         recipient: normalizePhone(sender),

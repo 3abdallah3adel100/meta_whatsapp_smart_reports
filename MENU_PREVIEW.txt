@@ -1,5 +1,9 @@
 📊 SMART META ADS REPORTS
 
+🏢 Team
+• Taher — Default لو مذكرتش Team
+• Cairo / Qaoud — تييم القاهرة / تييم قاعود
+
 📅 Range
 1. Today
 2. Yesterday
@@ -15,7 +19,7 @@
 • Allocation — Budget / Balance / Coverage
 • Full — كل التقارير
 
-👤 Agents
+👤 Taher Agents
 AA — Abdallah Adel
 HM — Ahmed Hesham
 BM — Bassem Shalawy
@@ -27,15 +31,25 @@ OS — Osama Serwe
 MM — Mohamed Mahmoud
 NB — Mohamed Nabih
 
+ℹ️ Cairo / Qaoud
+Overall only — بدون تقسيم Agents.
+
 Examples:
-3 EK Age
-7day - Esraa - Age
 Today AA
-Allocation
-3 EK Age Government
-Full AA
+7day EK Age
+Today Cairo
+7day Qaoud Age
+3 Cairo Government
+Full Cairo
 
 Natural Arabic:
+عايز تقرير صرف انهاردة
 عايز تقرير لعبدالله انهاردة للصرف وال AGE
-عايز المحافظات لاسراء اخر 7 ايام
-عايز الالوكيشن بتاع كل الناس
+عايز تقرير صرف انهاردة للقاهرة
+عايز السن لقاعود اخر 7 ايام
+عايز المحافظات لتييم القاهرة الشهر ده
+
+Default:
+لو مذكرتش Team → Taher تلقائي.
+لو Cairo/Qaoud → Overall بدون Agents.
+لو من غير Report Type → Spend تلقائي.

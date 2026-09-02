@@ -712,3 +712,24 @@ Actions
 → failed run
 → Generate requested WhatsApp report
 ```
+
+
+## Team routing
+
+The WhatsApp command parser supports two team scopes:
+
+- `Taher` — default when no team is mentioned.
+- `Cairo` / `Qaoud` / `تييم القاهرة` / `تييم قاعود` — Cairo Business `1935536750225128`.
+
+Examples:
+
+```text
+Today AA
+عايز تقرير صرف انهاردة
+Today Cairo
+7day Qaoud Age
+عايز تقرير صرف انهاردة للقاهرة
+عايز المحافظات لتييم قاعود اخر 7 ايام
+```
+
+Taher keeps the existing agent-based reporting. Cairo/Qaoud is always Overall and does not split Spend/Age/Governorate/Allocation by agent. Cairo lead counting keeps the existing WP/LG Cairo-specific objective logic.
