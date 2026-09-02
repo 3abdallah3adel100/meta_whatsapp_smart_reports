@@ -5,21 +5,18 @@ import os
 import re
 
 # ============================================================
-# Allocation / Balance configuration ONLY
+# ALLOCATION / BALANCE CONFIG ONLY
 # ============================================================
-# This file intentionally does not affect Spend / Age / Governorate.
+# These values intentionally mirror the working balance-main reference project.
+# Spend / Age / Governorate code is NOT affected by this file.
 
-DEFAULT_ALLOCATION_BUSINESS_IDS = [
+# IMPORTANT:
+# Keep the exact working Allocation business scope from balance-main.
+# We deliberately do NOT union this with REPORT_BUSINESS_IDS because the
+# working Allocation project does not do that.
+BUSINESS_IDS = [
     "751488620224306",
     "1178859133269743",
-]
-
-# Keep Allocation aware of the same businesses used by the Smart reports.
-# This prevents valid agents/accounts from disappearing simply because they
-# live in REPORT_BUSINESS_IDS rather than the older Allocation scope.
-DEFAULT_REPORT_BUSINESS_IDS = [
-    "1935536750225128",
-    "751488620224306",
 ]
 
 MEDIA_BUYER_MAP = {
@@ -36,67 +33,53 @@ MEDIA_BUYER_MAP = {
 }
 
 
-def _split_values(raw: str) -> list[str]:
-    return [
-        item.strip()
-        for item in re.split(r"[,;\n]+", raw or "")
-        if item.strip()
-    ]
+def _read_allocation_budget() -> float:
+    """Read the Allocation budget, with the working project value as fallback.
 
+    The working balance-main/config.py has OVERALL_ALLOCATION_BUDGET = 80000.0.
+    We keep 80,000 as the safe fallback so Allocation can never show
+    NOT CONFIGURED merely because GitHub failed to expose the optional secret.
 
-def _dedupe(values: list[str]) -> list[str]:
-    output: list[str] = []
-    seen: set[str] = set()
-    for value in values:
-        value = str(value or "").strip()
-        if value and value not in seen:
-            seen.add(value)
-            output.append(value)
-    return output
+    Accepted environment names:
+      OVERALL_ALLOCATION_BUDGET
+      ALLOCATION_BUDGET
 
-
-# Allocation keeps its original Business IDs, but ALSO inherits the report
-# Business IDs. This changes only Allocation account discovery.
-_allocation_ids = _split_values(os.getenv("ALLOCATION_BUSINESS_IDS", ""))
-if not _allocation_ids:
-    _allocation_ids = DEFAULT_ALLOCATION_BUSINESS_IDS.copy()
-
-_report_ids = _split_values(os.getenv("REPORT_BUSINESS_IDS", ""))
-if not _report_ids:
-    _report_ids = DEFAULT_REPORT_BUSINESS_IDS.copy()
-
-BUSINESS_IDS = _dedupe(_allocation_ids + _report_ids)
-
-
-def _read_money_env(*names: str, default: float = 0.0) -> float:
-    """Read an allocation money value robustly from env.
-
-    Supports both OVERALL_ALLOCATION_BUDGET and the shorter ALLOCATION_BUDGET,
-    and accepts values such as 250000 or 250,000.
+    Accepted examples:
+      80000
+      80,000
+      80000 EGP
+      EGP 80,000
     """
-    for name in names:
-        raw = os.getenv(name, "").strip()
+    for name in ("OVERALL_ALLOCATION_BUDGET", "ALLOCATION_BUDGET"):
+        raw = str(os.getenv(name, "") or "").strip()
         if not raw:
             continue
-        try:
-            return float(raw.replace(",", ""))
-        except ValueError:
+
+        normalized = raw.replace(",", "")
+        match = re.search(r"-?\d+(?:\.\d+)?", normalized)
+        if not match:
             continue
-    return float(default)
+
+        try:
+            value = float(match.group(0))
+            if value > 0:
+                return value
+        except (TypeError, ValueError):
+            pass
+
+    # Exact working reference value.
+    return 80000.0
 
 
-OVERALL_ALLOCATION_BUDGET = _read_money_env(
-    "OVERALL_ALLOCATION_BUDGET",
-    "ALLOCATION_BUDGET",
-    default=0.0,
-)
+OVERALL_ALLOCATION_BUDGET = _read_allocation_budget()
 
+# Same thresholds as the working balance-main project.
 CRITICAL_COVERAGE_DAYS = 1.0
 TARGET_COVERAGE_DAYS = 3.0
-
 ALLOCATION_ALIGNED_TOLERANCE_PCT = 10.0
 ALLOCATION_SIGNIFICANT_DIFF_PCT = 30.0
 
+# Meta budget/balance money fields are returned in minor units.
 CURRENCY_MINOR_UNIT_SCALE = {
     "EGP": 100.0,
     "USD": 100.0,
@@ -107,13 +90,8 @@ CURRENCY_MINOR_UNIT_SCALE = {
 }
 DEFAULT_MINOR_UNIT_SCALE = 100.0
 
-INCLUDE_ME_AD_ACCOUNTS = (
-    os.getenv("ALLOCATION_INCLUDE_ME_AD_ACCOUNTS", "true")
-    .strip()
-    .lower()
-    in {"1", "true", "yes", "on"}
-)
-
+# Exact working discovery behavior.
+INCLUDE_ME_AD_ACCOUNTS = True
 ME_ACCOUNT_NAME_PREFIXES = (
     "OK-FB-HR-",
     "OK-FB-NF-",
@@ -121,8 +99,9 @@ ME_ACCOUNT_NAME_PREFIXES = (
     "US-BO-HR-",
 )
 
+# Optional overrides remain supported from the Smart Report secret.
 MANUAL_BALANCE_OVERRIDES: dict[str, float] = {}
-raw_overrides = os.getenv("MANUAL_BALANCE_OVERRIDES_JSON", "").strip()
+raw_overrides = str(os.getenv("MANUAL_BALANCE_OVERRIDES_JSON", "") or "").strip()
 if raw_overrides:
     try:
         payload = json.loads(raw_overrides)
@@ -145,20 +124,12 @@ def clean_account_id(value) -> str:
 
 
 def extract_buyer_code(account_name: str) -> str:
+    """Exact media-buyer extraction used by the working balance-main project."""
     text = normalize_text(account_name)
     for code in MEDIA_BUYER_MAP:
-        # Standard separated code: ...-AA-... / ... AA ...
         pattern = rf"(?<![A-Z0-9]){re.escape(code)}(?![A-Z0-9])"
         if re.search(pattern, text):
             return code
-
-    # Fallback for compact account naming such as AA01 / EK02 while keeping
-    # the match tied to a separator before the code.
-    for code in MEDIA_BUYER_MAP:
-        compact = rf"(?<![A-Z0-9]){re.escape(code)}(?=\d)"
-        if re.search(compact, text):
-            return code
-
     return "UNKNOWN"
 
 
