@@ -47,7 +47,7 @@ from allocation_meta import fetch_full_snapshot
 
 
 BASE_URL = "https://graph.facebook.com"
-REPORT_BUILD = "2026-09-02-SMART-FLEX-REPORTS-V2-CAIRO-TEAM"
+REPORT_BUILD = "2026-09-03-SMART-FLEX-REPORTS-V3-CUSTOM-DATES"
 
 TEAM_BUSINESS_IDS = OrderedDict([
     ("Cairo Team", "1935536750225128"),
@@ -320,10 +320,100 @@ def normalize_range_key(value: str) -> str:
     return key
 
 
-def build_period(timezone_name: str, range_value: str) -> tuple[datetime, Period]:
+def _parse_iso_date(value: str):
+    try:
+        return datetime.strptime(
+            str(value or "").strip(),
+            "%Y-%m-%d",
+        ).date()
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid custom date: {value}. Expected YYYY-MM-DD."
+        ) from exc
+
+
+def _period_for_dates(
+    key: str,
+    label: str,
+    since,
+    until,
+) -> Period:
+    if until < since:
+        raise ValueError(
+            f"Invalid date range: {since} -> {until}"
+        )
+
+    return Period(
+        key=key,
+        label=label,
+        since=since.isoformat(),
+        until=until.isoformat(),
+    )
+
+
+def build_periods(
+    timezone_name: str,
+    range_value: str,
+) -> tuple[datetime, list[Period], bool]:
+    """Resolve preset, custom-range, single-day, or day-by-day requests.
+
+    Encoded custom values are produced by the Cloudflare parser:
+      custom:2026-08-01:2026-08-05
+      daily:2026-08-01:2026-08-05
+
+    Allocation remains a current-state report. The daily_split flag is used
+    only for Spend/Age/Governorate; Allocation is appended once by main().
+    """
     now = datetime.now(ZoneInfo(timezone_name))
     today = now.date()
-    key = normalize_range_key(range_value)
+    raw = str(range_value or "").strip()
+
+    custom_match = re.fullmatch(
+        r"(custom|daily):(\d{4}-\d{2}-\d{2}):(\d{4}-\d{2}-\d{2})",
+        raw,
+        flags=re.IGNORECASE,
+    )
+
+    if custom_match:
+        mode = custom_match.group(1).lower()
+        since = _parse_iso_date(custom_match.group(2))
+        until = _parse_iso_date(custom_match.group(3))
+
+        if until < since:
+            raise ValueError(
+                f"Custom range end is before start: {since} -> {until}"
+            )
+
+        if mode == "daily":
+            periods: list[Period] = []
+            current = since
+            while current <= until:
+                periods.append(
+                    _period_for_dates(
+                        key=f"day_{current.isoformat()}",
+                        label=current.isoformat(),
+                        since=current,
+                        until=current,
+                    )
+                )
+                current += timedelta(days=1)
+            return now, periods, True
+
+        label = (
+            since.isoformat()
+            if since == until
+            else "Custom Range"
+        )
+        return now, [
+            _period_for_dates(
+                key="custom",
+                label=label,
+                since=since,
+                until=until,
+            )
+        ], False
+
+    key = normalize_range_key(raw)
 
     if key == "today":
         since = until = today
@@ -345,12 +435,30 @@ def build_period(timezone_name: str, range_value: str) -> tuple[datetime, Period
     else:
         raise ValueError(f"Unsupported range: {range_value}")
 
-    return now, Period(
-        key=key,
-        label=RANGE_LABELS[key],
-        since=since.isoformat(),
-        until=until.isoformat(),
+    return now, [
+        _period_for_dates(
+            key=key,
+            label=RANGE_LABELS[key],
+            since=since,
+            until=until,
+        )
+    ], False
+
+
+def build_period(
+    timezone_name: str,
+    range_value: str,
+) -> tuple[datetime, Period]:
+    """Backward-compatible single-period wrapper."""
+    now, periods, daily_split = build_periods(
+        timezone_name,
+        range_value,
     )
+    if daily_split and len(periods) > 1:
+        raise ValueError(
+            "Day-by-day range contains multiple periods; use build_periods()."
+        )
+    return now, periods[0]
 
 
 def parse_report_types(raw: str) -> list[str]:
@@ -2727,16 +2835,26 @@ def main() -> int:
         dry_run=args.dry_run,
     )
 
-    generated_at, period = build_period(
+    generated_at, periods, daily_split = build_periods(
         config.timezone,
         args.range_value,
+    )
+
+    range_description = (
+        f"Each Day: {periods[0].since} -> {periods[-1].until}"
+        if daily_split
+        else (
+            periods[0].label
+            if periods[0].since == periods[0].until
+            else f"{periods[0].since} -> {periods[0].until}"
+        )
     )
 
     print("=" * 80)
     print("Smart Meta WhatsApp Report")
     print(f"Build: {REPORT_BUILD}")
     print(f"Command: {args.raw_command}")
-    print(f"Range: {period.label}")
+    print(f"Range: {range_description}")
     print(f"Team: {team_label(team_key)}")
     print(f"Scope: {request_scope_label(team_key, agent_code)}")
     print(f"Reports: {', '.join(report_types)}")
@@ -2745,14 +2863,52 @@ def main() -> int:
     )
     print("=" * 80)
 
-    messages = build_requested_messages(
-        config,
-        period,
-        team_key,
-        agent_code,
-        report_types,
-        generated_at,
-    )
+    messages: list[tuple[str, str]] = []
+
+    if daily_split:
+        # Spend / Age / Governorate are generated independently for each day.
+        # Allocation/Balance is intentionally current-state and is sent ONCE.
+        daily_report_types = [
+            report_type
+            for report_type in report_types
+            if report_type != "allocation"
+        ]
+
+        for day_period in periods:
+            if not daily_report_types:
+                break
+
+            day_messages = build_requested_messages(
+                config,
+                day_period,
+                team_key,
+                agent_code,
+                daily_report_types,
+                generated_at,
+            )
+            messages.extend(
+                (f"{label} {day_period.since}", body)
+                for label, body in day_messages
+            )
+
+        if "allocation" in report_types:
+            messages.extend(
+                build_allocation_messages(
+                    config,
+                    agent_code,
+                    generated_at,
+                    team_key=team_key,
+                )
+            )
+    else:
+        messages = build_requested_messages(
+            config,
+            periods[0],
+            team_key,
+            agent_code,
+            report_types,
+            generated_at,
+        )
 
     if not messages:
         raise RuntimeError(
