@@ -313,7 +313,14 @@ const REPORT_TYPES = {
       "الالوكيشن",
       "الالوكشن",
       "اللوكيشن",
+      "الوكيشن",
+      "لوكيشن",
       "بالانس",
+      "balance report",
+      "budget",
+      "daily budget",
+      "البدجت",
+      "بجت",
       "الرصيد",
     ],
   },
@@ -438,6 +445,270 @@ function phrasePresent(text, phrase) {
     padded(normalizedText).includes(target) ||
     padded(expandedText).includes(target)
   );
+}
+
+
+
+const MONTH_ALIASES = {
+  1: ["january", "jan", "يناير"],
+  2: ["february", "feb", "فبراير"],
+  3: ["march", "mar", "مارس"],
+  4: ["april", "apr", "ابريل"],
+  5: ["may", "مايو"],
+  6: ["june", "jun", "يونيو"],
+  7: ["july", "jul", "يوليو"],
+  8: ["august", "aug", "اغسطس"],
+  9: ["september", "sep", "sept", "سبتمبر"],
+  10: ["october", "oct", "اكتوبر"],
+  11: ["november", "nov", "نوفمبر"],
+  12: ["december", "dec", "ديسمبر"],
+};
+
+const MONTH_LOOKUP = (() => {
+  const lookup = new Map();
+  for (const [month, aliases] of Object.entries(MONTH_ALIASES)) {
+    for (const alias of aliases) {
+      lookup.set(normalizeText(alias), Number(month));
+    }
+  }
+  return lookup;
+})();
+
+
+function normalizeDateText(value) {
+  return translateDigits(value)
+    .toLowerCase()
+    .replace(/[\u064B-\u065F\u0670]/g, "")
+    .replace(/\u0640/g, "")
+    .replace(/[أإآ]/g, "ا")
+    .replace(/ى/g, "ي")
+    .replace(/[،,;:|()\[\]{}!?؟.]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+
+function cairoCurrentYear() {
+  // Egypt is always within one calendar year of UTC; using UTC avoids
+  // browser/Worker locale ambiguity and is sufficient for year inference.
+  return new Date().getUTCFullYear();
+}
+
+
+function expandTwoDigitYear(year) {
+  if (year == null) return null;
+  const number = Number(year);
+  if (!Number.isFinite(number)) return null;
+  if (number >= 100) return number;
+  return number >= 70 ? 1900 + number : 2000 + number;
+}
+
+
+function validDateParts(year, month, day) {
+  if (![year, month, day].every(Number.isInteger)) return false;
+  if (year < 2000 || year > 2100) return false;
+  if (month < 1 || month > 12 || day < 1 || day > 31) return false;
+  const dt = new Date(Date.UTC(year, month - 1, day));
+  return (
+    dt.getUTCFullYear() === year &&
+    dt.getUTCMonth() + 1 === month &&
+    dt.getUTCDate() === day
+  );
+}
+
+
+function isoDate(year, month, day) {
+  const mm = String(month).padStart(2, "0");
+  const dd = String(day).padStart(2, "0");
+  return `${year}-${mm}-${dd}`;
+}
+
+
+function parsePartialDate(value) {
+  const text = normalizeDateText(value);
+  if (!text) return null;
+
+  // Numeric: 1/8, 01-08-2026, 1.8.26
+  let match = text.match(
+    /(?:^|\s)(\d{1,2})\s*[\/\-.]\s*(\d{1,2})(?:\s*[\/\-.]\s*(\d{2,4}))?(?:\s|$)/
+  );
+  if (match) {
+    return {
+      day: Number(match[1]),
+      month: Number(match[2]),
+      year: expandTwoDigitYear(match[3]),
+    };
+  }
+
+  const monthPattern = [...MONTH_LOOKUP.keys()]
+    .sort((a, b) => b.length - a.length)
+    .map((name) => name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .join("|");
+
+  // 1 August 2026 / 1 اغسطس 2026
+  match = text.match(
+    new RegExp(`(?:^|\\s)(\\d{1,2})\\s+(${monthPattern})(?:\\s+(\\d{4}))?(?:\\s|$)`)
+  );
+  if (match) {
+    return {
+      day: Number(match[1]),
+      month: MONTH_LOOKUP.get(normalizeText(match[2])) || null,
+      year: match[3] ? Number(match[3]) : null,
+    };
+  }
+
+  // August 1 2026
+  match = text.match(
+    new RegExp(`(?:^|\\s)(${monthPattern})\\s+(\\d{1,2})(?:\\s+(\\d{4}))?(?:\\s|$)`)
+  );
+  if (match) {
+    return {
+      day: Number(match[2]),
+      month: MONTH_LOOKUP.get(normalizeText(match[1])) || null,
+      year: match[3] ? Number(match[3]) : null,
+    };
+  }
+
+  // Day-only form, useful inside "من 1 ل 5 اغسطس" after the range split.
+  match = text.match(/(?:^|\s)(\d{1,2})(?:\s|$)/);
+  if (match) {
+    return {
+      day: Number(match[1]),
+      month: null,
+      year: null,
+    };
+  }
+
+  return null;
+}
+
+
+function datePartsToNumber(parts) {
+  return parts.year * 10000 + parts.month * 100 + parts.day;
+}
+
+
+function resolveDatePair(startPartial, endPartial) {
+  if (!startPartial || !endPartial) return null;
+
+  const currentYear = cairoCurrentYear();
+  const start = { ...startPartial };
+  const end = { ...endPartial };
+
+  // Allow compact language such as "من 1 ل 5 اغسطس" or "from 1 Aug to 5".
+  if (!start.month && end.month) start.month = end.month;
+  if (!end.month && start.month) end.month = start.month;
+  if (!start.month || !end.month) return null;
+
+  start.year = start.year || end.year || currentYear;
+  end.year = end.year || start.year || currentYear;
+
+  // When no explicit end year is supplied and the range crosses New Year,
+  // e.g. "28 December to 3 January", move the end into the next year.
+  if (
+    !endPartial.year &&
+    datePartsToNumber(end) < datePartsToNumber(start) &&
+    end.month < start.month
+  ) {
+    end.year = start.year + 1;
+  }
+
+  if (!validDateParts(start.year, start.month, start.day)) return null;
+  if (!validDateParts(end.year, end.month, end.day)) return null;
+  if (datePartsToNumber(end) < datePartsToNumber(start)) return null;
+
+  return {
+    since: isoDate(start.year, start.month, start.day),
+    until: isoDate(end.year, end.month, end.day),
+  };
+}
+
+
+function isDailySplitRequested(input) {
+  const text = normalizeText(input);
+  return [
+    "كل يوم لوحده",
+    "كل يوم لوحدة",
+    "كل يوم لوحدها",
+    "كل يوم منفصل",
+    "كل يوم علي حده",
+    "كل يوم على حده",
+    "يوم بيوم",
+    "يوم يوم",
+    "each day",
+    "every day separately",
+    "day by day",
+    "daily breakdown",
+    "separate days",
+  ].some((alias) => phrasePresent(text, alias));
+}
+
+
+function parseCustomDateSelection(input) {
+  const raw = normalizeDateText(input);
+  if (!raw) return { matched: false };
+
+  const dailySplit = isDailySplitRequested(input);
+
+  // Arabic/English range: من ... ل/لحد/الى ... | from ... to/until ...
+  const rangePatterns = [
+    /(?:^|\s)من\s+(.+?)\s+(?:لحد|الي|الى|ل)\s+(.+)$/,
+    /(?:^|\s)from\s+(.+?)\s+(?:to|until|through)\s+(.+)$/,
+    /(?:^|\s)between\s+(.+?)\s+and\s+(.+)$/,
+  ];
+
+  for (const pattern of rangePatterns) {
+    const match = raw.match(pattern);
+    if (!match) continue;
+
+    const pair = resolveDatePair(
+      parsePartialDate(match[1]),
+      parsePartialDate(match[2])
+    );
+
+    if (pair) {
+      return {
+        matched: true,
+        since: pair.since,
+        until: pair.until,
+        dailySplit,
+        rangeKey: `${dailySplit ? "daily" : "custom"}:${pair.since}:${pair.until}`,
+        label: dailySplit
+          ? `Each Day | ${pair.since} → ${pair.until}`
+          : `${pair.since} → ${pair.until}`,
+      };
+    }
+  }
+
+  // Single explicit day: يوم 4 فبراير | day 4 February | on 4 Feb
+  const singlePatterns = [
+    /(?:^|\s)يوم\s+(.+)$/,
+    /(?:^|\s)day\s+(.+)$/,
+    /(?:^|\s)on\s+(.+)$/,
+  ];
+
+  for (const pattern of singlePatterns) {
+    const match = raw.match(pattern);
+    if (!match) continue;
+
+    const partial = parsePartialDate(match[1]);
+    if (!partial || !partial.month) continue;
+
+    const year = partial.year || cairoCurrentYear();
+    if (!validDateParts(year, partial.month, partial.day)) continue;
+
+    const iso = isoDate(year, partial.month, partial.day);
+    return {
+      matched: true,
+      since: iso,
+      until: iso,
+      dailySplit: false,
+      rangeKey: `custom:${iso}:${iso}`,
+      label: iso,
+    };
+  }
+
+  return { matched: false };
 }
 
 
@@ -567,7 +838,19 @@ function parseCommand(input) {
     return { type: "menu" };
   }
 
-  const range = firstRange(text);
+  const customDate = parseCustomDateSelection(input);
+  const presetRange = firstRange(text);
+  const range = customDate.matched
+    ? {
+        key: customDate.rangeKey,
+        label: customDate.label,
+        matched: true,
+        dailySplit: customDate.dailySplit,
+      }
+    : {
+        ...presetRange,
+        dailySplit: false,
+      };
   const teams = findTeams(text);
   const agents = findAgents(text);
   const reportSelection = findReportTypes(text);
@@ -632,6 +915,7 @@ function parseCommand(input) {
     type: "report",
     rangeKey: range.key,
     rangeLabel: range.label,
+    dailySplit: Boolean(range.dailySplit),
     teamKey,
     teamLabel: TEAMS[teamKey].label,
     agentCode,
@@ -667,6 +951,9 @@ function menuText() {
     "4. Last 30 Days",
     "5. This Month",
     "6. Last Month",
+    "• Custom: من 1 اغسطس ل 5 اغسطس",
+    "• Single Day: يوم 4 فبراير",
+    "• Day by Day: كل يوم لوحده من 1 اغسطس لحد 5 اغسطس",
     "",
     "📑 *Report Type*",
     "• Spend — Spend / Leads / CPL + Male",
@@ -704,6 +991,11 @@ function menuText() {
     "عايز تقرير صرف انهاردة للقاهرة",
     "عايز السن لقاعود اخر 7 ايام",
     "عايز المحافظات لتييم القاهرة الشهر ده",
+    "عايز صرف من 1 اغسطس ل 5 اغسطس",
+    "عايز كل يوم لوحده من 1 اغسطس لحد 5 اغسطس",
+    "عايز تقرير يوم 4 فبراير",
+    "Balance AA",
+    "الوكيشن",
     "",
     "لو مذكرتش Team → Taher تلقائي.",
     "لو Cairo/Qaoud → Overall بدون Agents.",
@@ -753,6 +1045,10 @@ function reportSummary(command) {
   lines.push(
     `📑 ${command.reportLabels.join(" + ")}`
   );
+
+  if (command.dailySplit) {
+    lines.push("🗓️ كل يوم هيتبعت كتقرير منفصل.");
+  }
 
   if (
     command.reportTypes.includes("allocation") &&
