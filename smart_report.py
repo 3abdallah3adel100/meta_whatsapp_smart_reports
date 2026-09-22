@@ -47,12 +47,14 @@ from allocation_meta import fetch_full_snapshot
 
 
 BASE_URL = "https://graph.facebook.com"
-REPORT_BUILD = "2026-09-03-SMART-FLEX-REPORTS-V3-CUSTOM-DATES"
+REPORT_BUILD = "2026-09-22-SMART-MULTI-TOKEN-MULTI-BUSINESS"
 
-TEAM_BUSINESS_IDS = OrderedDict([
-    ("Cairo Team", "1935536750225128"),
-    ("Taher Team", "751488620224306"),
-])
+DEFAULT_CAIRO_BUSINESS_ID = "1935536750225128"
+DEFAULT_TAHER_BUSINESS_IDS = (
+    "751488620224306",
+    "1178859133269743",
+    "1370772291128896",
+)
 
 AGE_BUCKET_ORDER = [
     "18-24",
@@ -81,6 +83,15 @@ class Config:
     timezone: str
     max_workers: int
     report_business_ids: list[str]
+    meta_access_token_2: str = ""
+
+    @property
+    def meta_tokens(self) -> dict[str, str]:
+        """Only labels travel with account rows; never store actual credentials there."""
+        result = {"token_1": self.meta_access_token}
+        if self.meta_access_token_2 and self.meta_access_token_2 != self.meta_access_token:
+            result["token_2"] = self.meta_access_token_2
+        return result
 
 
 @dataclass(frozen=True)
@@ -110,6 +121,24 @@ def split_values(raw: str) -> list[str]:
     ]
 
 
+# One GitHub Actions Variable defines the entire Taher business scope.
+# REPORT_BUSINESS_IDS / ALLOCATION_BUSINESS_IDS are legacy settings and are no
+# longer used by the Smart Report workflow; do not configure them for new IDs.
+CAIRO_BUSINESS_ID = (
+    os.getenv("CAIRO_BUSINESS_ID", "").strip() or DEFAULT_CAIRO_BUSINESS_ID
+)
+TAHER_BUSINESS_IDS = list(dict.fromkeys(split_values(
+    os.getenv("TAHER_BUSINESS_IDS", "").strip()
+    or ",".join(DEFAULT_TAHER_BUSINESS_IDS)
+)))
+TEAM_BUSINESS_IDS = OrderedDict([
+    ("Cairo Team", CAIRO_BUSINESS_ID),
+    ("Taher Team", TAHER_BUSINESS_IDS[0]),
+])
+if CAIRO_BUSINESS_ID in TAHER_BUSINESS_IDS:
+    raise RuntimeError("CAIRO_BUSINESS_ID cannot also be in TAHER_BUSINESS_IDS")
+
+
 def normalize_phone(value: str) -> str:
     digits = re.sub(r"\D", "", str(value or ""))
 
@@ -132,19 +161,11 @@ def load_config(recipient: str, dry_run: bool = False) -> Config:
     except ValueError:
         max_workers = 8
 
-    default_business_ids = list(TEAM_BUSINESS_IDS.values())
-    configured_ids = split_values(
-        os.getenv(
-            "REPORT_BUSINESS_IDS",
-            ",".join(default_business_ids),
-        )
-    )
-
-    # Team commands must always be able to reach both known businesses.
-    # This does not change Taher filtering; it only guarantees Cairo is discoverable.
-    for known_id in default_business_ids:
-        if known_id not in configured_ids:
-            configured_ids.append(known_id)
+    # Explicit team scopes: all configured Taher businesses plus Cairo only.
+    configured_ids = list(dict.fromkeys([
+        CAIRO_BUSINESS_ID,
+        *TAHER_BUSINESS_IDS,
+    ]))
 
     return Config(
         meta_access_token=require_env("META_ACCESS_TOKEN"),
@@ -166,7 +187,8 @@ def load_config(recipient: str, dry_run: bool = False) -> Config:
             "Africa/Cairo",
         ).strip() or "Africa/Cairo",
         max_workers=max_workers,
-        report_business_ids=configured_ids or default_business_ids,
+        report_business_ids=configured_ids,
+        meta_access_token_2=os.getenv("META_ACCESS_TOKEN_2", "").strip(),
     )
 
 
@@ -812,9 +834,10 @@ def fetch_all_pages(
 
 
 def team_name_for_business(business_id: str) -> str:
-    for team_name, known_id in TEAM_BUSINESS_IDS.items():
-        if str(business_id) == str(known_id):
-            return team_name
+    if str(business_id) == CAIRO_BUSINESS_ID:
+        return "Cairo Team"
+    if str(business_id) in TAHER_BUSINESS_IDS:
+        return "Taher Team"
     return "Generic Team"
 
 
@@ -824,39 +847,38 @@ def get_report_accounts(
     collected: list[dict[str, Any]] = []
     errors: list[str] = []
 
+    # Try each configured token against every configured Business ID. Expected
+    # access-denied results for a token are suppressed if another token can
+    # access that same edge; only real discovery failures are reported.
     for business_id in config.report_business_ids:
         team_name = team_name_for_business(business_id)
-
-        for edge in (
-            "owned_ad_accounts",
-            "client_ad_accounts",
-        ):
-            url = (
-                f"{BASE_URL}/{config.api_version}/"
-                f"{business_id}/{edge}"
-            )
-
-            params = {
-                "fields": (
-                    "id,account_id,name,"
-                    "account_status,currency"
-                ),
-                "access_token": config.meta_access_token,
-                "limit": 500,
-            }
-
-            try:
-                rows = fetch_all_pages(url, params)
-                for row in rows:
-                    item = dict(row)
-                    item["_team"] = team_name
-                    item["_business_id"] = business_id
-                    item["_source_edge"] = edge
-                    collected.append(item)
-            except Exception as exc:
-                errors.append(
-                    f"{business_id}/{edge}: {exc}"
-                )
+        for edge in ("owned_ad_accounts", "client_ad_accounts"):
+            url = f"{BASE_URL}/{config.api_version}/{business_id}/{edge}"
+            edge_errors = []
+            any_success = False
+            for token_key, access_token in config.meta_tokens.items():
+                params = {
+                    "fields": "id,account_id,name,account_status,currency",
+                    "access_token": access_token,
+                    "limit": 500,
+                }
+                try:
+                    rows = fetch_all_pages(url, params)
+                    any_success = True
+                    for row in rows:
+                        item = dict(row)
+                        item["_team"] = team_name
+                        item["_business_id"] = business_id
+                        item["_source_edge"] = edge
+                        item["_token_key"] = token_key  # Never store credentials.
+                        collected.append(item)
+                except Exception as exc:
+                    detail = str(exc)
+                    for secret in config.meta_tokens.values():
+                        detail = detail.replace(secret, "[REDACTED]")
+                    edge_errors.append(f"{business_id}/{edge} [{token_key}]: {detail}")
+            if not any_success:
+                errors.extend(edge_errors)
 
     dedup: dict[str, dict[str, Any]] = {}
 
@@ -895,7 +917,18 @@ def get_report_accounts(
     if not accounts:
         raise RuntimeError(
             "No Ad Accounts were discovered from "
-            "REPORT_BUSINESS_IDS."
+            "CAIRO_BUSINESS_ID / TAHER_BUSINESS_IDS."
+        )
+
+    for business_id in config.report_business_ids:
+        found_ids = {
+            normalize_account_id(item.get("id") or item.get("account_id"))
+            for item in collected if item.get("_business_id") == business_id
+        }
+        print(
+            f"Meta discovery: business={business_id} "
+            f"team={team_name_for_business(business_id)} "
+            f"unique_accounts={len(found_ids)}"
         )
 
     return accounts, errors
@@ -942,6 +975,7 @@ def fetch_insights(
     fields: str,
     level: str,
     breakdowns: str | None = None,
+    token_key: str = "token_1",
 ) -> list[dict[str, Any]]:
     clean_id = normalize_account_id(account_id)
     url = (
@@ -959,14 +993,28 @@ def fetch_insights(
             },
             separators=(",", ":"),
         ),
-        "access_token": config.meta_access_token,
         "limit": 5000,
     }
 
     if breakdowns:
         params["breakdowns"] = breakdowns
 
-    return fetch_all_pages(url, params)
+    # Preferred token from discovery, with a second-token fallback if Meta
+    # rejects read access to this particular account. Empty insights are valid.
+    keys = [token_key] + [key for key in config.meta_tokens if key != token_key]
+    failures = []
+    for key in keys:
+        token = config.meta_tokens.get(key)
+        if not token:
+            continue
+        try:
+            return fetch_all_pages(url, {**params, "access_token": token})
+        except Exception as exc:
+            detail = str(exc)
+            for secret in config.meta_tokens.values():
+                detail = detail.replace(secret, "[REDACTED]")
+            failures.append(f"{key}: {detail}")
+    raise MetaAPIError(f"Ad Account act_{clean_id}: " + " | ".join(failures))
 
 
 def fetch_account_report_data(
@@ -1013,6 +1061,7 @@ def fetch_account_report_data(
                     "spend,actions"
                 ),
                 level="campaign",
+                token_key=account.get("_token_key", "token_1"),
             )
         except Exception as exc:
             result["errors"].append(
@@ -1027,6 +1076,7 @@ def fetch_account_report_data(
                 fields="spend",
                 level="account",
                 breakdowns="gender",
+                token_key=account.get("_token_key", "token_1"),
             )
         except Exception as exc:
             result["errors"].append(
@@ -1044,6 +1094,7 @@ def fetch_account_report_data(
                     "spend,actions"
                 ),
                 level="campaign",
+                token_key=account.get("_token_key", "token_1"),
                 breakdowns="age",
             )
         except Exception as exc:
@@ -1062,6 +1113,7 @@ def fetch_account_report_data(
                     "spend,actions"
                 ),
                 level="campaign",
+                token_key=account.get("_token_key", "token_1"),
                 breakdowns="region",
             )
         except Exception as exc:
@@ -2265,66 +2317,73 @@ def build_allocation_recharge(
 
 
 
-def get_cairo_allocation_accounts(
-    client: AllocationMetaClient,
+def get_allocation_accounts_for_businesses(
+    clients: dict[str, AllocationMetaClient],
+    business_ids: list[str],
+    scope_label: str,
 ) -> pd.DataFrame:
-    """Load Cairo/Qaoud accounts only for Allocation.
-
-    This uses the same Allocation Meta client and budget logic as Taher, but
-    the account discovery is restricted to the Cairo Business ID so Taher data
-    cannot leak into a Cairo request.
-    """
-    business_id = TEAM_BUSINESS_IDS["Cairo Team"]
+    """Discover only the requested team businesses, with token-safe labels."""
     rows: list[dict[str, Any]] = []
-
+    errors: list[str] = []
     fields = (
         "id,account_id,name,account_status,currency,"
         "balance,amount_spent,spend_cap,funding_source_details,"
         "timezone_name,timezone_offset_hours_utc"
     )
+    for business_id in business_ids:
+        for edge in ("owned_ad_accounts", "client_ad_accounts"):
+            edge_errors = []
+            any_success = False
+            for token_key, client in clients.items():
+                try:
+                    part = client.fetch_all_pages(
+                        f"{business_id}/{edge}",
+                        {"fields": fields, "limit": 500},
+                    )
+                    any_success = True
+                    for row in part:
+                        item = dict(row)
+                        item["_token_key"] = token_key
+                        item["_business_id"] = business_id
+                        rows.append(item)
+                except Exception as exc:
+                    detail = str(exc)
+                    for token_client in clients.values():
+                        detail = detail.replace(token_client.access_token, "[REDACTED]")
+                    edge_errors.append(f"{business_id}/{edge} [{token_key}]: {detail}")
+            if not any_success:
+                errors.extend(edge_errors)
 
-    errors: list[str] = []
-
-    for edge in ("owned_ad_accounts", "client_ad_accounts"):
-        try:
-            part = client.fetch_all_pages(
-                f"{business_id}/{edge}",
-                {
-                    "fields": fields,
-                    "limit": 500,
-                },
-            )
-            rows.extend(part)
-        except Exception as exc:
-            errors.append(f"{business_id}/{edge}: {exc}")
-
-    if errors:
-        for error in errors:
-            print(f"WARNING Cairo Allocation discovery: {error}")
-
+    for error in errors:
+        print(f"WARNING {scope_label} Allocation discovery: {error}")
+    for business_id in business_ids:
+        unique_ids = {str(x.get("id") or x.get("account_id") or "")
+                      for x in rows if x.get("_business_id") == business_id}
+        unique_ids.discard("")
+        print(f"{scope_label} Allocation discovery: business={business_id} "
+              f"unique_accounts={len(unique_ids)}")
     if not rows:
         return pd.DataFrame()
-
     df = pd.DataFrame(rows)
-
     if "id" not in df.columns:
         return pd.DataFrame()
-
     if "name" not in df.columns:
         df["name"] = df["id"].astype(str)
-
     if "currency" not in df.columns:
         df["currency"] = "EGP"
-
-    df = (
-        df.sort_values(
-            [col for col in ["name", "id"] if col in df.columns]
-        )
+    return (
+        df.sort_values(["name", "id"], na_position="last")
         .drop_duplicates("id", keep="first")
         .reset_index(drop=True)
     )
 
-    return df
+
+def get_cairo_allocation_accounts(
+    clients: dict[str, AllocationMetaClient],
+) -> pd.DataFrame:
+    return get_allocation_accounts_for_businesses(
+        clients, [CAIRO_BUSINESS_ID], "Cairo"
+    )
 
 
 def build_cairo_allocation_report(
@@ -2464,19 +2523,17 @@ def build_allocation_messages(
     generated_at: datetime,
     team_key: str = "taher",
 ) -> list[tuple[str, str]]:
+    clients = {
+        key: AllocationMetaClient(access_token=token, api_version=config.api_version)
+        for key, token in config.meta_tokens.items()
+    }
+    primary_client = clients["token_1"]
     if team_key == "cairo":
         print(
             "Fetching current Cairo Allocation / Balance snapshot..."
         )
 
-        cairo_client = AllocationMetaClient(
-            access_token=config.meta_access_token,
-            api_version=config.api_version,
-        )
-
-        cairo_accounts = get_cairo_allocation_accounts(
-            cairo_client
-        )
+        cairo_accounts = get_cairo_allocation_accounts(clients)
 
         if cairo_accounts.empty:
             raise RuntimeError(
@@ -2484,10 +2541,11 @@ def build_allocation_messages(
             )
 
         cairo_snapshot, _details = fetch_full_snapshot(
-            cairo_client,
+            primary_client,
             cairo_accounts,
             max_workers=config.max_workers,
             spend_date=generated_at.date(),
+            clients_by_token_key=clients,
         )
 
         if cairo_snapshot.empty:
@@ -2503,17 +2561,10 @@ def build_allocation_messages(
             ),
         )]
 
-    # Taher Allocation path below is intentionally unchanged.
-    print(
-        "Fetching current Allocation / Balance snapshot..."
+    print("Fetching current Taher Allocation / Balance snapshot...")
+    accounts = get_allocation_accounts_for_businesses(
+        clients, TAHER_BUSINESS_IDS, "Taher"
     )
-
-    client = AllocationMetaClient(
-        access_token=config.meta_access_token,
-        api_version=config.api_version,
-    )
-
-    accounts = client.get_ad_accounts()
 
     if accounts.empty:
         raise RuntimeError(
@@ -2521,10 +2572,11 @@ def build_allocation_messages(
         )
 
     snapshot_df, _details = fetch_full_snapshot(
-        client,
+        primary_client,
         accounts,
         max_workers=config.max_workers,
         spend_date=generated_at.date(),
+        clients_by_token_key=clients,
     )
 
     if snapshot_df.empty:
