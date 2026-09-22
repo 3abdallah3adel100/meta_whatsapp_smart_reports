@@ -738,20 +738,50 @@ def fetch_full_snapshot(
     accounts_df: pd.DataFrame,
     max_workers: int = 8,
     spend_date: date | None = None,
+    clients_by_token_key: dict[str, MetaClient] | None = None,
 ) -> tuple[pd.DataFrame, list[dict]]:
     if accounts_df.empty:
         return pd.DataFrame(), []
 
+    token_clients = clients_by_token_key or {"token_1": client}
+
+    def fetch_with_correct_token(row: pd.Series) -> dict:
+        preferred = str(row.get("_token_key") or "token_1")
+        ordered_keys = [preferred] + [k for k in token_clients if k != preferred]
+        first_result = None
+        for key in ordered_keys:
+            selected_client = token_clients.get(key)
+            if selected_client is None:
+                continue
+            try:
+                result = fetch_account_snapshot(selected_client, row, spend_date)
+            except Exception:
+                if first_result is None and len(ordered_keys) == 1:
+                    raise
+                continue
+            if first_result is None:
+                first_result = result
+            # Only recheck if the account was completely unavailable with the
+            # first token. Do not double-count by returning multiple snapshots.
+            if result.get("fetch_status") != "ERROR":
+                return result
+        if first_result is not None:
+            return first_result
+        raise MetaAPIError(f"Could not fetch Allocation for {row.get('id', 'UNKNOWN')} with configured tokens")
+
     results: list[dict] = []
     with ThreadPoolExecutor(max_workers=max(1, min(max_workers, 16))) as executor:
         futures = [
-            executor.submit(fetch_account_snapshot, client, row, spend_date)
+            executor.submit(fetch_with_correct_token, row)
             for _, row in accounts_df.iterrows()
         ]
         for future in as_completed(futures):
             try:
                 results.append(future.result())
             except Exception as exc:
+                safe_error = str(exc)
+                for token_client in token_clients.values():
+                    safe_error = safe_error.replace(token_client.access_token, "[REDACTED]")
                 results.append({
                     "account_id": "UNKNOWN",
                     "account_name": "UNKNOWN",
@@ -776,14 +806,14 @@ def fetch_full_snapshot(
                     "adset_fetch_status": "ERROR",
                     "fetch_status": "ERROR",
                     "error_count": 1,
-                    "error": str(exc),
+                    "error": safe_error,
                     "budget_details": [],
                     "warnings": [],
                     "diagnostic_errors": [{
                         "entity_type": "snapshot",
                         "entity_id": "UNKNOWN",
                         "entity_name": "UNKNOWN",
-                        "error": str(exc),
+                        "error": safe_error,
                     }],
                 })
 
