@@ -10,14 +10,23 @@ import re
 # These values intentionally mirror the working balance-main reference project.
 # Spend / Age / Governorate code is NOT affected by this file.
 
-# IMPORTANT:
-# Keep the exact working Allocation business scope from balance-main.
-# We deliberately do NOT union this with REPORT_BUSINESS_IDS because the
-# working Allocation project does not do that.
-BUSINESS_IDS = [
+# Smart Report uses TAHER_BUSINESS_IDS as one source of truth for both
+# performance and allocation. The old ALLOCATION_BUSINESS_IDS remains a
+# fallback only when this file is run independently of the workflow.
+DEFAULT_BUSINESS_IDS = [
     "751488620224306",
     "1178859133269743",
+    "1370772291128896",
 ]
+_raw_business_ids = (
+    os.getenv("TAHER_BUSINESS_IDS", "").strip()
+    or os.getenv("ALLOCATION_BUSINESS_IDS", "").strip()
+    or ",".join(DEFAULT_BUSINESS_IDS)
+)
+BUSINESS_IDS = list(dict.fromkeys(
+    value.strip() for value in re.split(r"[,;\n]+", _raw_business_ids)
+    if value.strip()
+))
 
 MEDIA_BUYER_MAP = {
     "AA": "Abdallah Adel",
