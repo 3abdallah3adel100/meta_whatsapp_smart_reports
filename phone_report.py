@@ -316,73 +316,36 @@ def render_phone_report(api, records, errors, period, today, yesterday, team_key
         group['active'] += int(row['active'])
         group['lifetime'] |= row.get('lifetime', False)
         group['budget_missing'] |= row.get('budget_missing', False)
-    lines = ['📱 *تقرير أرقام واتساب*', f'النهارده: {today.since} | امبارح: {yesterday.since}',
-        f'الفريق: {api.team_label(team_key)}', f'الميديا باير: {api.scope_label(agent_code)}']
-    if phone_filter:
-        lines.append('البحث: ' + phone_filter.replace('suffix:', 'آخر أرقام: '))
+    label = 'Today' if (period.since, period.until) == (today.since, today.until) else (
+        'Yesterday' if (period.since, period.until) == (yesterday.since, yesterday.until) else
+        (period.since if period.since == period.until else f'{period.since} → {period.until}'))
+    names = {'AA': 'Abdallah', 'HM': 'Hesham', 'BM': 'Bassem', 'AF': 'Amr',
+             'EK': 'Esraa', 'MA': 'Mahmoud', 'MM': 'Mohamed Mahmoud', 'NB': 'Mohamed Nabih',
+             'SQ': 'Ahmed Sharkawy', 'OS': 'Osama'}
+    title = 'Overall' if agent_code == 'ALL' else names.get(agent_code, api.buyer_name(agent_code))
+    if team_key == 'cairo':
+        title = 'Cairo Overall'
+    lines = [f'*{title} WA Numbers*']
     if errors:
-        lines.append(f'⚠️ تقرير جزئي: {len(errors)} خطأ في جلب البيانات.')
-    if missing_budget:
-        lines.append('⚠️ بيانات بعض البادجت غير متاحة؛ إجمالي البادجت المؤكد قد يكون ناقصا.')
-    show_selected = (period.since, period.until) not in {(today.since, today.until), (yesterday.since, yesterday.until)}
-    totals = defaultdict(lambda: {**{k: 0.0 for k in METRICS}, 'budget': 0.0})
-    for (phone, currency), group in sorted(groups.items(), key=lambda kv: (-kv[1]['spend_today'], kv[0])):
-        for k in METRICS:
-            totals[currency][k] += group[k]
+        lines.append('⚠️ Partial data')
+    for (phone, currency), group in sorted(groups.items(), key=lambda kv: (-kv[1]['spend'], kv[0])):
         budget = exclusive[(phone, currency)]
-        totals[currency]['budget'] += budget
         shares = [b for b in shared if b['currency'] == currency and phone in (b['phones'] | b['candidates'])]
-        lines += ['', f'*+{phone}*', f"الميديا باير: {', '.join(api.buyer_name(b) for b in sorted(group['buyers']))}",
-            f"النهارده: صرف {group['spend_today']:,.2f} {currency} | محادثات {group['messages_today']:,.0f}",
-            f"امبارح: صرف {group['spend_yesterday']:,.2f} {currency} | محادثات {group['messages_yesterday']:,.0f}",
-            f'Daily Budget مخصص لهذا الرقم: {budget:,.2f} {currency}']
-        if shares:
-            lines.append('وله بادجت مشتركة؛ قيمتها وتفاصيلها أسفل التقرير، وليست مضافة بالكامل لهذا الرقم.')
-        if group['budget_missing']:
-            lines.append('⚠️ قيمة البادجت أعلاه هي الجزء المؤكد فقط؛ بعض البيانات غير متاحة.')
-        for suffix, title in [('today', 'النهارده'), ('yesterday', 'امبارح')]:
-            count = group['messages_' + suffix]
-            cost = f"{group['spend_' + suffix] / count:,.2f} {currency}" if count else 'N/A'
-            lines.append(f'تكلفة المحادثة {title}: {cost}')
-        if group['lifetime']:
-            lines.append('يوجد Lifetime Budget؛ لا يدخل ضمن Daily Budget.')
-        if show_selected:
-            lines.append(f"الفترة المطلوبة {period.since} → {period.until}: صرف {group['spend']:,.2f} {currency} | محادثات {group['messages']:,.0f}")
-        if show_selected:
-            cost = f"{group['spend'] / group['messages']:,.2f} {currency}" if group['messages'] else 'N/A'
-            lines.append(f'تكلفة المحادثة للفترة المطلوبة: {cost}')
-        lines.append(f"الحملات: {len(group['campaigns'])} | الإعلانات Active حاليا: {group['active']}")
+        # Keep one budget line while avoiding presenting an incomplete amount as exact.
+        budget_text = f'{budget:,.2f} {currency}'
+        if shares or group['budget_missing']:
+            budget_text = f'{budget:,.2f} {currency} (confirmed only)' if budget else 'N/A (shared or unavailable)'
+        lines += ['', f'WA Phonenumber : +{phone}',
+            f"Spend ( {label} ) : {group['spend']:,.2f} {currency}",
+            f"Messages : {group['messages']:,.0f}",
+            f'Daily budget : {budget_text}']
     if not groups:
-        lines.append('لم نجد أرقاما مؤكدة مطابقة؛ راجع تنبيهات الربط أدناه.')
-    selected_phones = {phone for phone, _ in groups}
-    relevant_shared = [b for b in shared if not phone_filter or selected_phones & (b['phones'] | b['candidates']) or any(matches_phone(n, phone_filter) for n in b['candidates'])]
-    for item in sorted(relevant_shared, key=lambda b: tuple(b['key'])):
-        known = sorted((item['phones'] | item['candidates']) - {''})
-        destinations = ', '.join('+' + n for n in known) or 'غير محددة'
-        if '' in item['phones']:
-            destinations += ' + وجهة أخرى/غير مؤكدة'
-        lines += ['', f"🔀 بادجت مشتركة/غير موزعة — {item['key'][1]} {item['label']}",
-            f"القيمة الكاملة: {item['amount']:,.2f} {item['currency']}", f'الوجهات: {destinations}']
-        # Whole owner may enter overall only when every target belongs to the selected numbers.
-        if '' not in item['phones'] and item['phones'] <= selected_phones:
-            totals[item['currency']]['budget'] += item['amount']
-        else:
-            lines.append('لم تضف إلى إجمالي البادجت المنسوب للأرقام المختارة؛ لا توجد حصة مؤكدة لكل وجهة.')
-    for currency, total in sorted(totals.items()):
-        lines += ['', f'*الإجمالي للأرقام المطابقة ({currency})*',
-            f"النهارده: صرف {total['spend_today']:,.2f} | محادثات {total['messages_today']:,.0f}",
-            f"امبارح: صرف {total['spend_yesterday']:,.2f} | محادثات {total['messages_yesterday']:,.0f}",
-            f"Daily Budget مؤكد بدون تكرار: {total['budget']:,.2f}"]
-        if show_selected:
-            lines.append(f"الفترة المطلوبة: صرف {total['spend']:,.2f} | محادثات {total['messages']:,.0f}")
-    for currency, vals in sorted(unknown.items()):
-        lines += ['', f'⚠️ صرف غير مرتبط برقم مؤكد / متعدد الوجهات ({currency}) — نطاق الحسابات كله:',
-            f"النهارده: {vals['spend_today']:,.2f} | محادثات {vals['messages_today']:,.0f}",
-            f"امبارح: {vals['spend_yesterday']:,.2f} | محادثات {vals['messages_yesterday']:,.0f}",
-            'لم يضف إلى إجماليات الأرقام.']
-        if show_selected:
-            lines.append(f"الفترة المطلوبة: {vals['spend']:,.2f} | محادثات {vals['messages']:,.0f}")
-    lines += ['', 'Daily Budget الحالي للإعلانات Active، حتى لو لم تصرف اليوم؛ لا يساوي الصرف الفعلي.',
-        'المحادثات = نتائج الإعلانات، وليست كل رسائل الواتساب.',
-        'ربط الرقم حسب الإعدادات الحالية؛ لو الرقم اتغير، توزيع الصرف التاريخي على الرقم القديم غير مؤكد.']
+        lines.append('No matching WA numbers found.')
+    # Diagnostics belong in GitHub logs, never in the WhatsApp report body.
+    for item in shared:
+        print('PHONE BUDGET DETAIL: ' + json.dumps(item, default=lambda v: sorted(v) if isinstance(v, set) else str(v), ensure_ascii=False))
+    for currency, values in unknown.items():
+        print('PHONE UNMAPPED DETAIL: ' + json.dumps({'currency': currency, **values}, ensure_ascii=False))
+    if missing_budget:
+        print(f'PHONE BUDGET WARNING: {missing_budget} ads have unavailable budget metadata')
     return '\n'.join(lines)
