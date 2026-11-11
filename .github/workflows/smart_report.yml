@@ -21,9 +21,15 @@ on:
         type: string
 
       report_types:
-        description: "spend,age,governorate,allocation"
+        description: "spend,age,governorate,allocation,phones"
         required: true
         default: "spend"
+        type: string
+
+      phone_filter:
+        description: "Optional full destination phone or suffix:5678"
+        required: false
+        default: ""
         type: string
 
       recipient:
@@ -62,6 +68,13 @@ jobs:
 
       - name: Generate requested WhatsApp report
         env:
+          INPUT_RANGE: ${{ inputs.range_key }}
+          INPUT_TEAM: ${{ inputs.team_key }}
+          INPUT_AGENT: ${{ inputs.agent_code }}
+          INPUT_REPORTS: ${{ inputs.report_types }}
+          INPUT_RECIPIENT: ${{ inputs.recipient }}
+          INPUT_RAW: ${{ inputs.raw_command }}
+          INPUT_PHONE: ${{ inputs.phone_filter }}
           META_ACCESS_TOKEN: ${{ secrets.META_ACCESS_TOKEN }}
           META_ACCESS_TOKEN_2: ${{ secrets.META_ACCESS_TOKEN_2 }}
           WHATSAPP_ACCESS_TOKEN: ${{ secrets.WHATSAPP_ACCESS_TOKEN }}
@@ -80,10 +93,11 @@ jobs:
 
         run: |
           python smart_report.py \
-            --range "${{ inputs.range_key }}" \
-            --team "${{ inputs.team_key }}" \
-            --agent "${{ inputs.agent_code }}" \
-            --reports "${{ inputs.report_types }}" \
-            --recipient "${{ inputs.recipient }}" \
-            --raw-command "${{ inputs.raw_command }}"
+            --range "$INPUT_RANGE" \
+            --team "$INPUT_TEAM" \
+            --agent "$INPUT_AGENT" \
+            --reports "$INPUT_REPORTS" \
+            --recipient "$INPUT_RECIPIENT" \
+            --raw-command "$INPUT_RAW" \
+            --phone "$INPUT_PHONE"
 
