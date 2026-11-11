@@ -6,6 +6,7 @@ import json
 import re
 import csv
 import os
+import threading
 from functools import lru_cache
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -136,6 +137,183 @@ def graph_read(api, config, path, fields, preferred='token_1', many=True):
     raise RuntimeError(' | '.join(errors))
 
 
+# Zero-config automatic attribution. Cache Page lookups per Actions run so
+# multiple ad accounts/media buyers do not query the same Page repeatedly.
+_PAGE_PHONE_CACHE = {}
+_PAGE_PHONE_LOCK = threading.RLock()
+
+
+def creative_page_id(ad, adset):
+    """Get a Page ID only from identity fields, never ad text or names."""
+    creative = ad.get('creative') or {}
+    spec = creative.get('object_story_spec') or {}
+    promoted = adset.get('promoted_object') or {}
+    for value in (spec.get('page_id'), promoted.get('page_id'), creative.get('object_id')):
+        if value and str(value).isdigit():
+            return str(value)
+    story = str(creative.get('effective_object_story_id') or
+                creative.get('object_story_id') or '')
+    if '_' in story and story.split('_', 1)[0].isdigit():
+        return story.split('_', 1)[0]
+    return ''
+
+
+def page_whatsapp_phone(api, config, page_id, preferred):
+    """Page-owned number is a last-resort *candidate*, not an ad-level fact.
+
+    Confirm against all explicit numbers for this Page at the report scope
+    before ever allocating its spend or budget to the Page's linked number.
+    """
+    if not page_id:
+        return ''
+    # One request per Page per preferred credential, regardless of media buyer.
+    key = (id(config), str(page_id), str(preferred))
+    with _PAGE_PHONE_LOCK:
+        if key in _PAGE_PHONE_CACHE:
+            return _PAGE_PHONE_CACHE[key]
+        try:
+            obj = graph_read(api, config, page_id, 'whatsapp_number', preferred, False)
+            number = normalize_destination((obj or {}).get('whatsapp_number'))
+        except Exception as exc:
+            # A valid ads_read token may lack Page Public Metadata Access.
+            # Neither make this a report error nor silently invent a number.
+            print('PHONE PAGE LOOKUP UNAVAILABLE: ' + json.dumps({
+                'page_id': str(page_id), 'reason': type(exc).__name__,
+            }, ensure_ascii=False))
+            number = ''
+        _PAGE_PHONE_CACHE[key] = number
+        return number
+
+
+def bulk_graph_objects(api, config, ids, fields, preferred, limit=50):
+    """Fetch missing Creative/Post metadata in chunks, not one call per Ad.
+
+    The optional endpoint may be inaccessible on some tokens.  Its failure
+    does not affect the already-audited spend or CBO/ABO budget totals.
+    """
+    result = {}
+    token = config.meta_tokens.get(preferred)
+    if not token:
+        return result
+    valid_ids = sorted({str(x) for x in ids if x and str(x).replace('_', '').isdigit()})
+    for pos in range(0, len(valid_ids), limit):
+        batch = valid_ids[pos:pos + limit]
+        try:
+            response = api.request_json('GET', f'{api.BASE_URL}/{config.api_version}/',
+                params={'ids': ','.join(batch), 'fields': fields, 'access_token': token},
+                attempts=1)
+            for object_id in batch:
+                item = response.get(object_id)
+                if isinstance(item, dict) and not item.get('error'):
+                    result[object_id] = item
+        except Exception as exc:
+            print('PHONE DYNAMIC BATCH UNAVAILABLE: ' + json.dumps({
+                'items': len(batch), 'reason': type(exc).__name__,
+            }, ensure_ascii=False))
+    return result
+
+
+def enrich_unresolved_creatives(api, config, admap, setmap, period_insights, preferred):
+    """Try the full AdCreative / Page-post source for missing CTWA numbers.
+
+    Most ads need no additional API request: only current/selected spending or
+    ACTIVE ads with an unresolved destination are eligible for batch lookup.
+    """
+    creative_ids = set()
+    for ad_id, ad in admap.items():
+        sid = str(ad.get('adset_id') or '')
+        adset = setmap.get(sid) or {}
+        creative = ad.get('creative') or {}
+        numbers, ids = extract_destinations({'creative': creative,
+                                             'promoted_object': adset.get('promoted_object') or {}})
+        if numbers or ids:
+            continue
+        if (str(ad.get('effective_status') or '') != 'ACTIVE'
+                and not any(float(rows.get(ad_id, {}).get('spend') or 0) > 0
+                            for rows in period_insights.values())):
+            continue
+        creative_id = str(creative.get('id') or '')
+        if creative_id:
+            creative_ids.add(creative_id)
+
+    # The AdCreative endpoint may surface fields omitted by the nested /ads edge.
+    extra = bulk_graph_objects(api, config, creative_ids,
+        'id,whats_app_business_phone_number,object_story_spec,call_to_action,'
+        'effective_object_story_id,wamo_whatsapp_identity_spec,asset_feed_spec',
+        preferred)
+    for ad in admap.values():
+        creative = ad.get('creative') or {}
+        detail = extra.get(str(creative.get('id') or ''))
+        if detail:
+            # Combine metadata, preserving the already returned nested fields.
+            supplied = {key: value for key, value in creative.items()
+                        if value is not None and value != '' and value != {} and value != []}
+            ad['creative'] = {**detail, **supplied}
+
+    # Reused/boosted posts can have no object_story_spec on the Creative.
+    # Read CTA/attachment URLs from those published posts if Meta allows.
+    missing_posts = set()
+    for ad_id, ad in admap.items():
+        creative = ad.get('creative') or {}
+        sid = str(ad.get('adset_id') or '')
+        adset = setmap.get(sid) or {}
+        numbers, ids = extract_destinations({'creative': creative,
+                                             'promoted_object': adset.get('promoted_object') or {}})
+        if not numbers and not ids:
+            story = str(creative.get('effective_object_story_id') or '')
+            if story and (ad.get('effective_status') == 'ACTIVE' or
+                          any(float(rows.get(ad_id, {}).get('spend') or 0) > 0
+                              for rows in period_insights.values())):
+                missing_posts.add(story)
+    post_data = bulk_graph_objects(api, config, missing_posts,
+        'id,attachments{url,unshimmed_url,subattachments},call_to_action', preferred)
+    for ad in admap.values():
+        story = str((ad.get('creative') or {}).get('effective_object_story_id') or '')
+        if story in post_data:
+            ad['_wa_post_metadata'] = post_data[story]
+
+
+def apply_page_phone_candidates(records):
+    """Make a Page fallback only when it agrees with explicitly known ads.
+
+    A Page can run ads to more than one WhatsApp number. We never infer when
+    another explicit number conflicts with the Page's linked number.
+    """
+    explicit_by_page = defaultdict(set)
+    for row in records:
+        page = str(row.get('page_id') or '')
+        if page and row.get('phone'):
+            explicit_by_page[page].add(row['phone'])
+    resolved = 0
+    conflicts = 0
+    for row in records:
+        if row.get('phone') or row.get('budget_only') or row.get('owner_only'):
+            continue
+        page = str(row.get('page_id') or '')
+        candidate = str(row.get('page_phone_candidate') or '')
+        if not page or not candidate:
+            continue
+        # Do not attribute mixed Messenger/WhatsApp destinations.
+        dest = str(row.get('destination_type') or '').upper()
+        if (not row.get('wa_destination') or 'MESSENGER' in dest or
+                'INSTAGRAM' in dest or 'MULTIPLE' in dest):
+            continue
+        known = explicit_by_page.get(page, set())
+        if known and known != {candidate}:
+            conflicts += 1
+            continue
+        row['phone'] = candidate
+        row['phone_source'] = 'page_linked_number'
+        row['reason'] = ''
+        row.setdefault('candidate_phones', set()).add(candidate)
+        resolved += 1
+    if resolved or conflicts:
+        print('PHONE PAGE AUTO RESOLUTION: ' + json.dumps({
+            'ads_resolved': resolved, 'ads_conflicting': conflicts,
+        }, ensure_ascii=False))
+    return resolved
+
+
 def collect_account(api, config, account, period, today=None, yesterday=None):
     account_id = api.normalize_account_id(account.get('id'))
     preferred = account.get('_token_key', 'token_1')
@@ -166,8 +344,10 @@ def collect_account(api, config, account, period, today=None, yesterday=None):
     # For CTWA, the destination phone is sometimes stored at the TOP LEVEL of
     # AdCreative rather than in object_story_spec or the ad set. Without this
     # field many real WhatsApp ads show as destination-unknown.
-    fallback_ad_fields = 'id,adset_id,campaign_id,effective_status,creative{object_story_spec,asset_feed_spec,call_to_action,link_url}'
-    ad_fields = 'id,adset_id,campaign_id,effective_status,creative{object_story_spec,asset_feed_spec,call_to_action,link_url,whats_app_business_phone_number}'
+    fallback_ad_fields = 'id,adset_id,campaign_id,effective_status,creative{id,object_story_spec,asset_feed_spec,call_to_action,link_url}'
+    ad_fields = ('id,adset_id,campaign_id,effective_status,creative{'
+                 'id,object_story_spec,asset_feed_spec,call_to_action,link_url,'
+                 'whats_app_business_phone_number,effective_object_story_id}')
     ad_inventory_complete = True
     try:
         try:
@@ -176,7 +356,8 @@ def collect_account(api, config, account, period, today=None, yesterday=None):
             # Older tokens/API versions may reject this optional creative
             # field; fall back ONLY for a genuine unsupported-field error.
             detail = str(exc).lower()
-            unsupported = ('whats_app_business_phone_number' in detail and
+            unsupported = (any(k in detail for k in ('whats_app_business_phone_number',
+                      'effective_object_story_id')) and
                            any(k in detail for k in ('unknown', 'nonexisting', 'does not exist',
                                                      'cannot query', 'unsupported field')))
             if not unsupported:
@@ -264,6 +445,10 @@ def collect_account(api, config, account, period, today=None, yesterday=None):
             live_owners.clear()
             stopped_ads.clear()
 
+    # Optional attribution discovery, done AFTER budget reconciliation so a
+    # Page/Creative permissions failure never turns correct totals into zero.
+    enrich_unresolved_creatives(api, config, admap, setmap, by_period, preferred)
+
     print('PHONE BUDGET CLOSING: ' + json.dumps({
         'account_id': account_id,
         'live': sum(v['amount'] for v in live_owners.values()),
@@ -293,7 +478,7 @@ def collect_account(api, config, account, period, today=None, yesterday=None):
             except Exception:
                 setmap[adset_id] = {}
         adset = setmap.get(adset_id, {})
-        metadata = {'creative': ad.get('creative') or {}, 'promoted_object': adset.get('promoted_object') or {}}
+        metadata = {'creative': ad.get('creative') or {}, 'promoted_object': adset.get('promoted_object') or {}, 'post': ad.get('_wa_post_metadata') or {}}
         numbers, phone_ids = extract_destinations(metadata)
         # Fill API metadata gaps with explicitly verified Ad/Ad Set mappings.
         # Ad-specific mapping overrides an Ad Set default when two ads use
@@ -318,6 +503,11 @@ def collect_account(api, config, account, period, today=None, yesterday=None):
                     resolved_ids[phone_id] = ''
             if resolved_ids[phone_id]:
                 numbers.add(resolved_ids[phone_id])
+        page_id = creative_page_id(ad, adset)
+        page_candidate = ''
+        if not numbers and not phone_ids and page_id and (active or
+                float(by_period['today'].get(ad_id, {}).get('spend') or 0) > 0):
+            page_candidate = page_whatsapp_phone(api, config, page_id, preferred)
         destination = str(adset.get('destination_type') or '').upper()
         metadata_text = json.dumps(metadata).upper()
         has_messages = any(a.get('action_type') in MESSAGE_KEYS for a in (row.get('actions') or []) if isinstance(a, dict))
@@ -360,7 +550,9 @@ def collect_account(api, config, account, period, today=None, yesterday=None):
             'destination_type': destination, 'active': active, 'budget': budget,
             'budget_missing': budget_missing, 'lifetime': lifetime, 'budget_only': not reportable,
             'candidate_phones': numbers, 'budget_targets_incomplete': not ad_inventory_complete,
-            'phone_source': 'verified_mapping' if mapped and number else 'meta' if number else ''}
+            'phone_source': 'verified_mapping' if mapped and number else 'meta' if number else '',
+            'page_id': page_id, 'page_phone_candidate': page_candidate,
+            'wa_destination': is_whatsapp}
         for key, mapping in by_period.items():
             # Always retain the source Insights values: dropping the spend of
             # ads with an unknown/non-WA destination made the visible total
@@ -428,6 +620,9 @@ def build_phone_report(api, config, period, team_key, agent_code, phone_filter='
                 errors.append(f"{futures[future].get('id')}: {exc}")
     if not successful:
         raise RuntimeError('All phone-report account queries failed; no total was generated.')
+    # One pass for ALL buyers and discovered accounts.  No spreadsheet,
+    # hard-coded phone list, or manually assigned account defaults needed.
+    apply_page_phone_candidates(records)
     for error in errors:
         safe = str(error)
         for secret in config.meta_tokens.values():
@@ -548,7 +743,7 @@ def render_phone_report(api, records, errors, period, today, yesterday, team_key
         if not matches_phone(row['phone'], phone_filter):
             continue
         key = (row['phone'], row['currency'])
-        group = groups.setdefault(key, {**{k: 0.0 for k in METRICS}, 'buyers': set(), 'campaigns': set(), 'active': 0, 'lifetime': False, 'budget_missing': False})
+        group = groups.setdefault(key, {**{k: 0.0 for k in METRICS}, 'buyers': set(), 'campaigns': set(), 'active': 0, 'lifetime': False, 'budget_missing': False, 'page_linked_spend': 0.0})
         for k in METRICS:
             group[k] += row.get(k, 0)
         group['buyers'].add(row['buyer'])
@@ -557,6 +752,8 @@ def render_phone_report(api, records, errors, period, today, yesterday, team_key
         group['active'] += int(row['active'])
         group['lifetime'] |= row.get('lifetime', False)
         group['budget_missing'] |= row.get('budget_missing', False)
+        if row.get('phone_source') == 'page_linked_number':
+            group['page_linked_spend'] += float(row.get('spend') or 0)
     label = 'Today' if (period.since, period.until) == (today.since, today.until) else (
         'Yesterday' if (period.since, period.until) == (yesterday.since, yesterday.until) else
         (period.since if period.since == period.until else f'{period.since} → {period.until}'))
@@ -584,6 +781,8 @@ def render_phone_report(api, records, errors, period, today, yesterday, team_key
             f"Messages : {group['messages']:,.0f}",
             f'Daily budget : {budget_text}',
             f'Live daily budget : {live_text}']
+        if group.get('page_linked_spend', 0) > 0:
+            lines.append(f"⚠️ Page-linked attribution (estimate): {group['page_linked_spend']:,.2f} {currency}")
     if not groups:
         lines.append('No matching WA numbers found.')
     if not phone_filter and (period.since, period.until) == (today.since, today.until):
