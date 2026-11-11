@@ -4,6 +4,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse, parse_qs
 import json
 import re
+import csv
+import os
+from functools import lru_cache
+from pathlib import Path
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from types import SimpleNamespace
@@ -69,6 +73,48 @@ def matches_phone(number, query):
     if query.startswith('suffix:'):
         return number.endswith(query.split(':', 1)[1])
     return number == normalize_destination(query)
+
+
+@lru_cache(maxsize=1)
+def load_phone_mapping():
+    """Optional exact destination registry, not an inferred account-level number.
+
+    Map each Ad ID or a verified single-destination Ad Set. An empty phone
+    means 'unverified' and is intentionally not used for attribution.
+    """
+    path = Path(os.getenv('WA_PHONE_MAPPING_FILE') or
+                Path(__file__).with_name('wa_phone_mapping.csv'))
+    if not path.exists():
+        return {}, {}
+    by_ad, by_adset = {}, {}
+    with path.open(encoding='utf-8-sig', newline='') as stream:
+        reader = csv.DictReader(stream)
+        required = {'account_id', 'adset_id', 'ad_id', 'phone'}
+        if not reader.fieldnames or not required.issubset(set(reader.fieldnames)):
+            raise ValueError('WA phone mapping requires columns: account_id,adset_id,ad_id,phone')
+        for lineno, row in enumerate(reader, start=2):
+            number = str(row.get('phone') or '').strip()
+            if not number:
+                continue  # Unverified row: do not guess a phone.
+            number = normalize_destination(number)
+            if not number:
+                raise ValueError(f'Invalid WA destination in mapping line {lineno}')
+            account_id = str(row.get('account_id') or '').strip().removeprefix('act_')
+            ad_id, adset_id = (str(row.get(key) or '').strip()
+                               for key in ('ad_id', 'adset_id'))
+            if not account_id or not (ad_id or adset_id):
+                raise ValueError(f'Missing account/ad or adset ID on mapping line {lineno}')
+            target, identity = (by_ad, ad_id) if ad_id else (by_adset, adset_id)
+            key = (account_id, identity)
+            if key in target and target[key] != number:
+                raise ValueError(f'Conflicting WA destinations in mapping for {key}')
+            target[key] = number
+    return by_ad, by_adset
+
+
+def mapped_destination(account_id, adset_id, ad_id):
+    by_ad, by_adset = load_phone_mapping()
+    return by_ad.get((account_id, ad_id)) or by_adset.get((account_id, adset_id), '')
 
 
 def graph_read(api, config, path, fields, preferred='token_1', many=True):
@@ -249,6 +295,20 @@ def collect_account(api, config, account, period, today=None, yesterday=None):
         adset = setmap.get(adset_id, {})
         metadata = {'creative': ad.get('creative') or {}, 'promoted_object': adset.get('promoted_object') or {}}
         numbers, phone_ids = extract_destinations(metadata)
+        # Fill API metadata gaps with explicitly verified Ad/Ad Set mappings.
+        # Ad-specific mapping overrides an Ad Set default when two ads use
+        # different WA destinations inside the same Ad Set.
+        mapped = mapped_destination(account_id, adset_id, ad_id)
+        mapping_conflict = bool(mapped and numbers and mapped not in numbers)
+        if mapping_conflict:
+            issues.append(f'{account_id}: WA phone mapping conflicts with Meta for ad {ad_id}')
+            print('PHONE MAPPING CONFLICT: ' + json.dumps({
+                'account_id': account_id, 'ad_id': ad_id, 'adset_id': adset_id,
+                'meta_numbers': sorted(numbers), 'mapped_number': mapped,
+            }, ensure_ascii=False))
+        elif mapped:
+            numbers = {mapped}
+            phone_ids = set()  # Explicit destination resolves inaccessible phone-ID lookups.
         for phone_id in phone_ids:
             if phone_id not in resolved_ids:
                 try:
@@ -274,7 +334,8 @@ def collect_account(api, config, account, period, today=None, yesterday=None):
             continue
         mixed = bool(is_whatsapp and ('MESSENGER' in destination or 'INSTAGRAM' in destination or destination == 'MULTIPLE'))
         # An ad with multiple destinations cannot have its full spend assigned to each.
-        number = next(iter(numbers)) if len(numbers) == 1 and not mixed and not any(not resolved_ids[i] for i in phone_ids) else ''
+        number = (next(iter(numbers)) if len(numbers) == 1 and not mixed
+                  and not mapping_conflict and not any(not resolved_ids[i] for i in phone_ids) else '')
         reason = ('multiple destinations' if mixed or len(numbers) > 1 else
                   'destination not returned by Meta' if reportable else
                   'WhatsApp destination not verified') if not number else ''
@@ -298,7 +359,8 @@ def collect_account(api, config, account, period, today=None, yesterday=None):
             'campaign_id': campaign_id, 'adset_id': adset_id,
             'destination_type': destination, 'active': active, 'budget': budget,
             'budget_missing': budget_missing, 'lifetime': lifetime, 'budget_only': not reportable,
-            'candidate_phones': numbers, 'budget_targets_incomplete': not ad_inventory_complete}
+            'candidate_phones': numbers, 'budget_targets_incomplete': not ad_inventory_complete,
+            'phone_source': 'verified_mapping' if mapped and number else 'meta' if number else ''}
         for key, mapping in by_period.items():
             # Always retain the source Insights values: dropping the spend of
             # ads with an unknown/non-WA destination made the visible total
