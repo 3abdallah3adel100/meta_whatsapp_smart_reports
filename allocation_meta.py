@@ -303,52 +303,54 @@ class MetaClient:
         return spend
 
     def get_today_spend_maps(self, account_id: str, today: date | None = None):
-        """One Insights request provides account, CBO and ABO spend totals.
+        """One ad-level Insights query: spends are never added at multiple levels.
 
-        Requesting spend at ad-set level includes its campaign_id. Aggregate
-        locally, instead of hitting Meta separately for account + campaign +
-        adset, or making a request for every active entity when spend is zero.
-        That preserves stopped-entity spend for the closing-budget calculation.
+        Ad-level records are essential to distinguish a PAUSED ad within a
+        still-active ad set. Aggregate campaign, adset and account spend from
+        those SAME unique ad rows so CBO/ABO/ads cannot duplicate spend.
         """
         clean_id = clean_account_id(account_id)
         day = today or date.today()
-        fields = "campaign_id,adset_id,spend,date_start,date_stop"
-        params = {"fields": fields, "level": "adset", "limit": 2000,
+        fields = "ad_id,adset_id,campaign_id,spend,date_start,date_stop"
+        params = {"fields": fields, "level": "ad", "limit": 2000,
                   **self._today_params_exact(day)}
-        source = "account_adset_exact_time_range"
+        source = "account_ad_exact_time_range"
         try:
             rows = self.fetch_all_pages(f"act_{clean_id}/insights", params)
         except MetaAPIError as exc:
             message = str(exc).lower()
             if any(x in message for x in ("code=17", "code=4", "code=32", "code=613", "code=80004", "api 429", "rate limit")):
                 raise
-            # Some Meta accounts reject the bracketed time_range syntax.
             rows = []
-            print(f"Insights exact date query failed for act_{clean_id}; trying Meta date_preset")
-            source = "account_adset_date_preset_today"
+            source = "account_ad_date_preset_today"
         if not rows:
-            # A zero-spend account can legitimately return an empty first query.
-            # Keep Meta's timezone-aware fallback while avoiding three others.
             rows = self.fetch_all_pages(
                 f"act_{clean_id}/insights",
-                {"fields": fields, "level": "adset", "date_preset": "today", "limit": 2000},
+                {"fields": fields, "level": "ad", "date_preset": "today", "limit": 2000},
             )
-            source = "account_adset_date_preset_today"
+            source = "account_ad_date_preset_today"
         by_campaign: dict[str, float] = {}
         by_adset: dict[str, float] = {}
+        ad_spend_rows: list[dict] = []
+        seen = set()
         total = 0.0
         for item in rows:
-            spend = _money_float(item.get("spend"))
+            spent = _money_float(item.get("spend"))
+            if spent <= 0:
+                continue
+            aid = str(item.get("ad_id") or "").strip()
             cid = str(item.get("campaign_id") or "").strip()
             sid = str(item.get("adset_id") or "").strip()
-            if spend > 0 and (not cid or not sid):
-                raise MetaAPIError(f"Incomplete campaign/adset IDs in Insights for act_{clean_id}; refusing incomplete budget")
-            if not sid or not cid:
-                continue
-            by_campaign[cid] = by_campaign.get(cid, 0.0) + spend
-            by_adset[sid] = by_adset.get(sid, 0.0) + spend
-            total += spend
-        return total, by_campaign, by_adset, source, len(rows)
+            if not aid or not cid or not sid:
+                raise MetaAPIError(f"Incomplete ad/campaign/adset IDs in Insights for act_{clean_id}")
+            if aid in seen:
+                raise MetaAPIError(f"Duplicate ad_id in Insights for act_{clean_id}: {aid}; refusing inflated totals")
+            seen.add(aid)
+            by_campaign[cid] = by_campaign.get(cid, 0.0) + spent
+            by_adset[sid] = by_adset.get(sid, 0.0) + spent
+            ad_spend_rows.append(dict(ad_id=aid, adset_id=sid, campaign_id=cid, spend=spent))
+            total += spent
+        return total, by_campaign, by_adset, source, len(rows), ad_spend_rows
 
     def get_level_today_spend_map(
         self,
@@ -571,18 +573,17 @@ def _entity_spend_map(
 
 
 def calculate_account_daily_budget(campaigns, adsets, campaign_spend_by_id,
-                                   adset_spend_by_id, currency, ads):
-    from budget_policy import closing_budgets
-    owners = closing_budgets(campaigns.to_dict('records'), adsets.to_dict('records'), ads,
+                                   adset_spend_by_id, currency, ads, ad_spend_rows=None):
+    from budget_policy import allocation_budget_breakdown
+    live_total, stopped_total, details = allocation_budget_breakdown(
+        campaigns.to_dict('records'), adsets.to_dict('records'), ads,
         campaign_spend_by_id, adset_spend_by_id,
-        lambda value: api_money_to_major(value, currency))
-    details = [dict(budget_level=kind, entity_id=entity_id, daily_budget=item['amount'],
-                    calculation_mode=item['mode'], entity_name=item['label'])
-               for (kind, entity_id), item in owners.items()]
+        lambda value: api_money_to_major(value, currency),
+        ad_spend_rows=ad_spend_rows)
     print('BUDGET CLOSING: ' + json.dumps(details, ensure_ascii=False))
-    campaign_total = sum(x['amount'] for (kind, _), x in owners.items() if kind == 'CBO')
-    adset_total = sum(x['amount'] for (kind, _), x in owners.items() if kind == 'ABO')
-    return campaign_total + adset_total, campaign_total, adset_total, details
+    campaign_total = sum(x['daily_budget'] for x in details if x['budget_level'] == 'CBO')
+    adset_total = sum(x['daily_budget'] for x in details if x['budget_level'] == 'ABO')
+    return live_total + stopped_total, campaign_total, adset_total, details
 
 
 def fetch_account_snapshot(client: MetaClient, account_row: pd.Series, spend_date: date | None = None) -> dict:
@@ -601,12 +602,16 @@ def fetch_account_snapshot(client: MetaClient, account_row: pd.Series, spend_dat
     ads = client.fetch_all_pages(f'act_{account_id}/ads',
         {'fields': 'id,campaign_id,adset_id,effective_status', 'limit': 500})
     campaign_fetch_status = adset_fetch_status = 'OK'
+    ad_spend_rows = None
 
     if callable(getattr(client, "get_today_spend_maps", None)):
         # One bulk adset-level Insights call replaces 3 separate account-level
         # requests plus an unbounded per-campaign / per-adset fallback.
+        spend_result = client.get_today_spend_maps(account_id, spend_date)
         (spend_today, campaign_spend_by_id, adset_spend_by_id,
-         spend_source, spend_rows) = client.get_today_spend_maps(account_id, spend_date)
+         spend_source, spend_rows) = spend_result[:5]
+        if len(spend_result) >= 6:
+            ad_spend_rows = spend_result[5]
         campaign_spend_source = adset_spend_source = spend_source
         campaign_spend_rows = adset_spend_rows = spend_rows
     else:
@@ -705,6 +710,39 @@ def fetch_account_snapshot(client: MetaClient, account_row: pd.Series, spend_dat
         spend_today = adset_total_spend
         spend_source = "reconstructed_from_adset_insights"
 
+    # Spent ads may be archived and absent from account edges. Recover their
+    # parent / status to avoid counting the same spend at multiple levels.
+    # This normally makes ZERO extra calls (all spend IDs exist in the edges).
+    if ad_spend_rows is not None:
+        known_adsets = {str(x.get('id') or '') for x in adsets.to_dict('records')}
+        for sid in {str(x['adset_id']) for x in ad_spend_rows} - known_adsets:
+            parent = client._get(sid, {'fields': 'id,name,campaign_id,effective_status,daily_budget,lifetime_budget'})
+            if str(parent.get('id') or '') != sid:
+                raise MetaAPIError('Could not recover spent ad set ' + sid)
+            adsets = pd.concat([adsets, pd.DataFrame([parent])], ignore_index=True)
+        known_ads = {str(x.get('id') or '') for x in ads}
+        adset_lookup = {str(x['id']): x for x in adsets.to_dict('records')}
+        campaign_lookup = {str(x['id']): x for x in campaigns.to_dict('records')}
+        for metric in ad_spend_rows:
+            aid = str(metric['ad_id'])
+            if aid in known_ads:
+                continue
+            group = adset_lookup.get(str(metric['adset_id']), {})
+            campaign = campaign_lookup.get(str(metric['campaign_id']), {})
+            # A paused ancestor proves the ad cannot be live. Do not waste a
+            # Meta request recovering archived ad metadata in this case.
+            if (str(group.get('effective_status') or '').upper() != 'ACTIVE'
+                or (campaign and str(campaign.get('effective_status') or '').upper() != 'ACTIVE')):
+                continue
+            try:
+                ad = client._get(aid, {'fields': 'id,campaign_id,adset_id,effective_status'})
+            except Exception as exc:
+                raise MetaAPIError(f'Missing status for spent ad {aid} under ACTIVE parents: {exc}')
+            if str(ad.get('id') or '') != aid:
+                raise MetaAPIError('Unexpected ad metadata for ' + aid)
+            ads.append(ad)
+            known_ads.add(aid)
+
     # Account edges may omit archived/deleted parents. Only recover parents
     # needed for an active child or an ad set that actually spent today.
     known_campaigns = set(campaigns.get('id', pd.Series(dtype=str)).astype(str))
@@ -728,6 +766,7 @@ def fetch_account_snapshot(client: MetaClient, account_row: pd.Series, spend_dat
         adset_spend_by_id,
         currency,
         ads,
+        ad_spend_rows=ad_spend_rows,
     )
 
     # Live budget is ONLY the current effective budget of running owners.
@@ -738,6 +777,20 @@ def fetch_account_snapshot(client: MetaClient, account_row: pd.Series, spend_dat
         for item in budget_details
         if item.get("calculation_mode") == "live"
     )
+    stopped_spend_today = sum(
+        _money_float(item.get("daily_budget"))
+        for item in budget_details
+        if item.get("calculation_mode") == "spent"
+    )
+    print('BUDGET AUDIT: ' + json.dumps({
+        'account_id': account_id,
+        'overall_daily_budget': round(daily_budget, 2),
+        'live_daily_budget': round(live_daily_budget, 2),
+        'stopped_spend_today': round(stopped_spend_today, 2),
+        'live_owners': sum(x['calculation_mode'] == 'live' for x in budget_details),
+        'stopped_ads': sum(x['calculation_mode'] == 'spent' for x in budget_details),
+        'total_spend_today': round(spend_today, 2),
+    }, ensure_ascii=False))
 
     # A positive account spend with no spend found at campaign/adset level is
     # suspicious. Surface it explicitly instead of pretending the budget is zero.
@@ -746,8 +799,9 @@ def fetch_account_snapshot(client: MetaClient, account_row: pd.Series, spend_dat
             "Account has Spend Today > 0 but no ACTIVE Campaign/Ad Set with both daily_budget and spend was found."
         )
 
-    coverage_days = balance / daily_budget if balance is not None and daily_budget > 0 else None
-    required_for_3_days = max(0.0, daily_budget * 3.0 - balance) if balance is not None and daily_budget > 0 else None
+    # Coverage is operational runway. Stopped delivery does not continue spending.
+    coverage_days = balance / live_daily_budget if balance is not None and live_daily_budget > 0 else None
+    required_for_3_days = max(0.0, live_daily_budget * 3.0 - balance) if balance is not None and live_daily_budget > 0 else None
 
     if diagnostic_errors:
         fetch_status = "ERROR" if campaign_fetch_status == "ERROR" and adset_fetch_status == "ERROR" else "WARNING"
@@ -779,6 +833,7 @@ def fetch_account_snapshot(client: MetaClient, account_row: pd.Series, spend_dat
         "adset_daily_budget": adset_daily_budget,
         "active_daily_budget": daily_budget,  # closing budget: live + stopped spend
         "live_daily_budget": live_daily_budget,  # running budgets only
+        "stopped_spend_today": stopped_spend_today,
         "balance": balance,
         "balance_source": balance_source,
         "coverage_days": coverage_days,
@@ -866,6 +921,7 @@ def fetch_full_snapshot(
                     "adset_daily_budget": 0.0,
                     "active_daily_budget": 0.0,
                     "live_daily_budget": 0.0,
+                    "stopped_spend_today": 0.0,
                     "balance": None,
                     "balance_source": "unavailable",
                     "coverage_days": None,

@@ -32,3 +32,141 @@ def closing_budgets(campaigns, adsets, ads, campaign_spend, adset_spend, money):
         if amount > 0:
             owners[('ABO', sid)] = dict(amount=amount, mode='live' if live else 'spent', label=adset.get('name') or sid)
     return owners
+
+
+def allocation_budget_breakdown(campaigns, adsets, ads, campaign_spend,
+                                adset_spend, money, ad_spend_rows=None):
+    """Compute the two Allocation totals without mixing budgets and spent money.
+
+    The original (working) Allocation budget rule was ACTIVE + positive spend
+    today. Add the missing third-level guard: at least one effective ACTIVE ad.
+
+    A daily-budget *owner* is a CBO campaign or an ABO adset, never both.
+    Budget figures are taken once per owner. Stopped spend comes from unique
+    ad-level Insights rows; a stopped ad may be inside a still-running owner.
+    Summing ad spend once avoids adding campaign + adset + ad spend for the
+    same stopped delivery.
+
+    `ad_spend_rows=None` exists only for old clients/tests without ad insights:
+    in that compatibility path only entirely stopped owners can be reconciled.
+    """
+    campaigns = {str(x['id']): x for x in campaigns}
+    adsets = {str(x['id']): x for x in adsets}
+    ads = {str(x['id']): x for x in ads if x.get('id')}
+
+    def active(entity):
+        return str((entity or {}).get('effective_status') or '').upper() == 'ACTIVE'
+
+    def amount(value):
+        number = float(value or 0)
+        return number if number > 0 else 0.0
+
+    def parent_owns_budget(campaign):
+        return (money(campaign.get('daily_budget')) or 0) > 0 or (money(campaign.get('lifetime_budget')) or 0) > 0
+
+    # Match only ad IDs that belong to known parents; a paused ancestor is not live.
+    live_campaigns, live_adsets = set(), set()
+    for ad in ads.values():
+        sid, cid = str(ad.get('adset_id') or ''), str(ad.get('campaign_id') or '')
+        parent, group = campaigns.get(cid), adsets.get(sid)
+        if not (active(ad) and active(parent) and active(group)):
+            continue
+        if str(group.get('campaign_id') or '') != cid:
+            raise ValueError(f'Inconsistent ad / adset parent: {sid}, {cid}')
+        live_campaigns.add(cid)
+        live_adsets.add(sid)
+
+    details = []
+    counted_budget_ids = set()
+    for cid, campaign in campaigns.items():
+        daily = money(campaign.get('daily_budget')) or 0
+        # The old working code required spend > 0, unlike the broken new policy.
+        if daily > 0 and cid in live_campaigns and amount(campaign_spend.get(cid)) > 0:
+            key = ('CBO', cid)
+            if key not in counted_budget_ids:
+                details.append(dict(budget_level='CBO', entity_id=cid,
+                                    daily_budget=float(daily), calculation_mode='live',
+                                    entity_name=campaign.get('name') or cid))
+                counted_budget_ids.add(key)
+
+    for sid, group in adsets.items():
+        cid = str(group.get('campaign_id') or '')
+        campaign = campaigns.get(cid)
+        if campaign is None:
+            if sid in live_adsets or amount(adset_spend.get(sid)):
+                raise ValueError(f'Missing campaign metadata: {cid} (adset {sid})')
+            continue
+        if parent_owns_budget(campaign):
+            continue  # Never add ABO underneath CBO or a lifetime-funded CBO.
+        daily = money(group.get('daily_budget')) or 0
+        if daily > 0 and sid in live_adsets and amount(adset_spend.get(sid)) > 0:
+            key = ('ABO', sid)
+            if key not in counted_budget_ids:
+                details.append(dict(budget_level='ABO', entity_id=sid,
+                                    daily_budget=float(daily), calculation_mode='live',
+                                    entity_name=group.get('name') or sid))
+                counted_budget_ids.add(key)
+
+    if ad_spend_rows is not None:
+        # Exactly one Insights row per ad/day. Disallow silent double counting.
+        seen_ads = set()
+        for metric in ad_spend_rows:
+            spent = amount(metric.get('spend'))
+            if not spent:
+                continue
+            aid = str(metric.get('ad_id') or '')
+            cid = str(metric.get('campaign_id') or '')
+            sid = str(metric.get('adset_id') or '')
+            if not aid or not cid or not sid:
+                raise ValueError('Missing ad/campaign/adset ID in positive-spend Insights')
+            if aid in seen_ads:
+                raise ValueError(f'Duplicate ad_id in daily Insights: {aid}')
+            seen_ads.add(aid)
+            campaign, group, ad = campaigns.get(cid), adsets.get(sid), ads.get(aid)
+            if campaign is None or group is None:
+                raise ValueError(f'Missing parent metadata for spent ad {aid}: {cid}/{sid}')
+            if str(group.get('campaign_id') or '') != cid:
+                raise ValueError(f'Ad set/campaign mismatch for spent ad {aid}')
+            if ad and (str(ad.get('campaign_id') or '') != cid or str(ad.get('adset_id') or '') != sid):
+                raise ValueError(f'Ad metadata/Insights mismatch for spent ad {aid}')
+            # The account edge may omit archived ads: if its parents are still
+            # active, status is ambiguous and we must NOT guess it was stopped.
+            if ad is None and active(campaign) and active(group):
+                raise ValueError(f'Missing status for spent ad {aid} under active parents')
+            is_live = bool(ad and active(ad) and active(campaign) and active(group))
+            if is_live:
+                continue
+            level = 'CBO' if parent_owns_budget(campaign) else 'ABO'
+            details.append(dict(budget_level=level, entity_id=aid,
+                                daily_budget=spent, calculation_mode='spent',
+                                entity_name=f'Stopped ad {aid}',
+                                campaign_id=cid, adset_id=sid))
+    else:
+        # Compatibility for fake legacy clients without per-ad Insights.
+        # This cannot split stopped ads inside an active budget owner.
+        for cid, campaign in campaigns.items():
+            if not parent_owns_budget(campaign) or cid in live_campaigns:
+                continue
+            spent = amount(campaign_spend.get(cid))
+            if spent:
+                details.append(dict(budget_level='CBO', entity_id=cid,
+                                    daily_budget=spent, calculation_mode='spent',
+                                    entity_name=campaign.get('name') or cid))
+        for sid, group in adsets.items():
+            cid = str(group.get('campaign_id') or '')
+            campaign = campaigns.get(cid)
+            if campaign is None:
+                if amount(adset_spend.get(sid)):
+                    raise ValueError(f'Missing campaign metadata for spent adset: {sid}')
+                continue
+            if parent_owns_budget(campaign) or sid in live_adsets:
+                continue
+            spent = amount(adset_spend.get(sid))
+            if spent:
+                details.append(dict(budget_level='ABO', entity_id=sid,
+                                    daily_budget=spent, calculation_mode='spent',
+                                    entity_name=group.get('name') or sid))
+
+    live_total = sum(x['daily_budget'] for x in details if x['calculation_mode'] == 'live')
+    stopped_total = sum(x['daily_budget'] for x in details if x['calculation_mode'] == 'spent')
+    return live_total, stopped_total, details
