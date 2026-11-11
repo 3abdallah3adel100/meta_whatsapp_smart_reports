@@ -43,22 +43,15 @@ def redact_meta_error(exc: Exception, tokens: dict[str, str]) -> str:
     return message[:600]
 
 
-def graph_accounts(token: str, api_version: str, path: str, fields: str) -> list[dict]:
-    """Read every pagination page without printing a URL containing access_token."""
+def graph_accounts(token: str, api_version: str, path: str, fields: str,
+                   client: MetaClient | None = None) -> list[dict]:
+    """Read all pages with the same rate-limit policy as other Meta requests."""
+    graph_client = client or MetaClient(access_token=token, api_version=api_version)
     url = f"https://graph.facebook.com/{api_version}/{path}"
     params = {"access_token": token, "fields": fields, "limit": 500}
     rows: list[dict] = []
     while url:
-        response = requests.get(url, params=params, timeout=60)
-        if not response.ok:
-            try:
-                error = response.json().get("error", {})
-                message = error.get("message", "Meta account discovery error")
-                code = error.get("code", response.status_code)
-            except (ValueError, AttributeError):
-                message, code = "Meta account discovery error", response.status_code
-            raise RuntimeError(f"Meta API code={code}: {message[:300]}")
-        data = response.json()
+        data = graph_client._get(url, params)
         rows.extend(data.get("data", []))
         next_url = data.get("paging", {}).get("next")
         if next_url and not next_url.startswith("https://graph.facebook.com/"):
@@ -130,13 +123,19 @@ def discover_all_accounts(clients: dict[str, MetaClient], business_ids: list[str
                 try:
                     try:
                         rows = graph_accounts(client.access_token, api_version,
-                                              f"{business_id}/{edge}", META_ACCOUNT_FIELDS)
-                    except RuntimeError:
+                                              f"{business_id}/{edge}", META_ACCOUNT_FIELDS, client=client)
+                    except RuntimeError as exc:
                         # A restricted optional account field should not hide
-                        # otherwise accessible accounts.
+                        # otherwise accessible accounts. A rate limit must NOT
+                        # trigger another identical request using fewer fields.
+                        detail = str(exc).lower()
+                        if ('code=17' in detail or 'code=4' in detail or
+                                'code=32' in detail or 'code=613' in detail or
+                                'request limit' in detail or 'rate limit' in detail):
+                            raise
                         rows = graph_accounts(client.access_token, api_version,
                                               f"{business_id}/{edge}",
-                                              "id,account_id,name,account_status,currency")
+                                              "id,account_id,name,account_status,currency", client=client)
                     business_edge_success[business_id] += 1
                     for row in rows:
                         add(row, label, source)
@@ -153,7 +152,7 @@ def discover_all_accounts(clients: dict[str, MetaClient], business_ids: list[str
         # outside the configured businesses. Do not include unrelated names.
         try:
             rows = graph_accounts(client.access_token, api_version, "me/adaccounts",
-                                  "id,account_id,name,account_status,currency")
+                                  "id,account_id,name,account_status,currency", client=client)
             for row in rows:
                 name = str(row.get("name") or "").upper()
                 if any(prefix in name for prefix in ACCOUNT_NAME_PREFIXES):
@@ -234,7 +233,7 @@ def collect_multi_token_snapshot(clients: dict[str, MetaClient], business_ids: l
     details: list[dict] = []
     failed: list[str] = []
     token_counts: Counter = Counter()
-    with ThreadPoolExecutor(max_workers=max(1, min(int(max_workers), 10))) as executor:
+    with ThreadPoolExecutor(max_workers=max(1, min(int(max_workers), 3))) as executor:
         futures = {executor.submit(fetch_account_with_fallback, account_id, candidates,
                                    clients, spend_date): account_id
                    for account_id, candidates in discovered.items()}

@@ -6,6 +6,8 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import date
+from threading import Lock
+import time
 from typing import Any
 
 import pandas as pd
@@ -48,17 +50,42 @@ class MetaClient:
     timeout: int = 60
     discovery_errors: list[str] = field(default_factory=list)
 
+    # The same client is shared across all account workers for one Meta token.
+    # Pace requests and share the cooldown so a rate-limit response from one
+    # worker slows the other workers instead of causing a retry storm.
+    _pace_lock: Lock = field(default_factory=Lock, init=False, repr=False)
+    _next_request_at: float = field(default=0.0, init=False, repr=False)
+    min_request_spacing: float = 0.35
+    max_rate_limit_retries: int = 4
+
+    def _reserve_request_slot(self) -> None:
+        with self._pace_lock:
+            request_at = max(time.monotonic(), self._next_request_at)
+            self._next_request_at = request_at + max(0.0, self.min_request_spacing)
+        delay = request_at - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+
+    def _rate_limit_cooldown(self, seconds: float) -> None:
+        with self._pace_lock:
+            self._next_request_at = max(self._next_request_at, time.monotonic() + seconds)
+
     def _get(self, path_or_url: str, params: dict[str, Any] | None = None) -> dict:
         url = path_or_url if path_or_url.startswith("http") else f"{BASE_URL}/{self.api_version}/{path_or_url.lstrip('/')}"
         request_params = dict(params or {})
         request_params.setdefault("access_token", self.access_token)
-        response = requests.get(url, params=request_params, timeout=self.timeout)
-        try:
-            payload = response.json()
-        except Exception:
-            payload = {}
-        if not response.ok:
+        for attempt in range(self.max_rate_limit_retries + 1):
+            self._reserve_request_slot()
+            response = requests.get(url, params=request_params, timeout=self.timeout)
+            try:
+                payload = response.json()
+            except Exception:
+                payload = {}
+            if response.ok:
+                return payload
             error = payload.get("error", {}) if isinstance(payload, dict) else {}
+            if not isinstance(error, dict):
+                error = {}
             message = error.get("message") or response.text or "Unknown Meta API error"
             code = error.get("code")
             subcode = error.get("error_subcode")
@@ -68,8 +95,23 @@ class MetaClient:
             if subcode is not None:
                 extra.append(f"subcode={subcode}")
             suffix = f" ({', '.join(extra)})" if extra else ""
-            raise MetaAPIError(f"Meta API {response.status_code}{suffix}: {message[:1200]}")
-        return payload
+            # Meta commonly returns HTTP 400 + code 17 for a *temporary* rate
+            # limit. Never retry permission errors (code 200), which need a
+            # different authorized token instead.
+            retryable = (code in (4, 17, 32, 613, 80004)
+                         or response.status_code in (429, 500, 502, 503, 504))
+            if retryable and attempt < self.max_rate_limit_retries:
+                try:
+                    server_delay = float(response.headers.get("Retry-After", 0))
+                except (TypeError, ValueError, AttributeError):
+                    server_delay = 0.0
+                backoff = min(60.0, max(4.0 * (2 ** attempt), server_delay))
+                self._rate_limit_cooldown(backoff)
+                print(f"Meta API temporary limit/error (code={code}, http={response.status_code}); "
+                      f"retry {attempt + 1}/{self.max_rate_limit_retries} after cooldown")
+                continue
+            raise MetaAPIError(f"Meta API {response.status_code}{suffix}: {str(message)[:1200]}")
+        raise MetaAPIError("Meta API retries exhausted")
 
     def fetch_all_pages(self, path_or_url: str, params: dict[str, Any] | None = None) -> list[dict]:
         rows: list[dict] = []
