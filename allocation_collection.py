@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 import requests
 from allocation_meta import MetaClient, fetch_full_snapshot
+from allocation_config import extract_buyer_code
 
 # Business IDs for Taher. The GitHub Variable overrides this default.
 # No tokens are ever saved to a dataframe or written to the report.
@@ -195,11 +196,18 @@ def fetch_account_with_fallback(account_id: str, candidates: list[tuple[str, dic
     errors: list[str] = []
     first_partial = None
     all_tokens = {label: client.access_token for label, client in clients.items()}
+    # Try the tokens that actually discovered this account first. If all of
+    # them fail because of a NON-quota error, legacy blind fallback can still
+    # rescue an unexpected permission or data-sync issue. Never blindly try
+    # another token once the real issue is a hard Meta quota limit.
     attempts = list(candidates)
     known_labels = {label for label, _ in attempts}
-    if attempts:
-        attempts.extend((label, dict(attempts[0][1])) for label in clients if label not in known_labels)
-    for label, row in attempts:
+    unproven = [(label, dict(attempts[0][1]))
+                for label in clients if label not in known_labels] if attempts else []
+    index = 0
+    while index < len(attempts):
+        label, row = attempts[index]
+        index += 1
         try:
             frame, details = fetch_full_snapshot(
                 clients[label], pd.DataFrame([row]), max_workers=1, spend_date=spend_date
@@ -219,6 +227,13 @@ def fetch_account_with_fallback(account_id: str, candidates: list[tuple[str, dic
             print(f"ALLOCATION FETCH ERROR act_{account_id} via {label}: {safe_reason}")
         except Exception as exc:
             errors.append(f"{label}: {redact_meta_error(exc, all_tokens)}")
+        if index == len(attempts) and unproven:
+            quota_error = any(any(term in reason.lower() for term in (
+                'code=17', 'code=4', 'code=32', 'code=613', 'code=80004',
+                'rate limit', 'request limit', 'rate limited')) for reason in errors)
+            if not quota_error:
+                attempts.extend(unproven)
+            unproven = []
     if first_partial is not None:
         frame, details, label = first_partial
         return frame, details, label, errors
@@ -227,8 +242,17 @@ def fetch_account_with_fallback(account_id: str, candidates: list[tuple[str, dic
 
 def collect_multi_token_snapshot(clients: dict[str, MetaClient], business_ids: list[str],
                                  api_version: str, spend_date,
-                                 max_workers: int, include_me_accounts: bool = True) -> tuple[pd.DataFrame, list[dict], list[str]]:
+                                 max_workers: int, include_me_accounts: bool = True,
+                                 agent_code: str = 'ALL') -> tuple[pd.DataFrame, list[dict], list[str]]:
     discovered, warnings = discover_all_accounts(clients, business_ids, api_version, include_me_accounts)
+    # Filtering AFTER all accounts were fetched was extremely costly for a
+    # single-media-buyer request; select the same accounts BEFORE fetching.
+    if agent_code and agent_code.upper() != 'ALL':
+        selected_code = agent_code.strip().upper()
+        discovered = {aid: options for aid, options in discovered.items()
+                      if any(extract_buyer_code(row.get('name')) == selected_code
+                             for _, row in options)}
+        print(f'Allocation scope {selected_code}: {len(discovered)} matching accounts')
     if not discovered:
         raise RuntimeError("No eligible ad accounts discovered from either token. Reports were NOT sent.")
     frames: list[pd.DataFrame] = []

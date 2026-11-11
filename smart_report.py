@@ -2582,6 +2582,7 @@ def build_allocation_messages(
     snapshot_df, _details, warnings = collect_multi_token_snapshot(
         clients, TAHER_BUSINESS_IDS, config.api_version,
         generated_at.date(), config.max_workers,
+        agent_code=agent_code,
     )
     for warning in warnings:
         print(f"WARNING Taher Allocation: {warning}")
