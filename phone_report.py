@@ -103,12 +103,39 @@ def collect_account(api, config, account, period, today=None, yesterday=None):
         if dates not in cached:
             cached[dates] = api.fetch_insights(config, account_id, wanted,
                 fields='ad_id,adset_id,campaign_id,campaign_name,spend,actions', level='ad', token_key=preferred)
-        by_period[key] = {str(row.get('ad_id')): row for row in cached[dates]}
+        # Never silently overwrite two positive-spend rows (or a row without
+        # an ad ID). That used to make money disappear before attribution.
+        indexed = {}
+        for metric in cached[dates]:
+            ad_id = str(metric.get('ad_id') or '')
+            if not ad_id:
+                if float(metric.get('spend') or 0) > 0:
+                    raise ValueError(f'{account_id}: positive-spend Insights row has no ad_id')
+                continue
+            if ad_id in indexed:
+                raise ValueError(f'{account_id}: duplicate ad_id {ad_id} in Insights {dates}')
+            indexed[ad_id] = metric
+        by_period[key] = indexed
     insights = list({str(row.get('ad_id')): row for rows in cached.values() for row in rows}.values())
-    ad_fields = 'id,adset_id,campaign_id,effective_status,creative{object_story_spec,asset_feed_spec,call_to_action,link_url}'
+    # For CTWA, the destination phone is sometimes stored at the TOP LEVEL of
+    # AdCreative rather than in object_story_spec or the ad set. Without this
+    # field many real WhatsApp ads show as destination-unknown.
+    fallback_ad_fields = 'id,adset_id,campaign_id,effective_status,creative{object_story_spec,asset_feed_spec,call_to_action,link_url}'
+    ad_fields = 'id,adset_id,campaign_id,effective_status,creative{object_story_spec,asset_feed_spec,call_to_action,link_url,whats_app_business_phone_number}'
     ad_inventory_complete = True
     try:
-        ads = graph_read(api, config, f'act_{account_id}/ads', ad_fields, preferred)
+        try:
+            ads = graph_read(api, config, f'act_{account_id}/ads', ad_fields, preferred)
+        except Exception as exc:
+            # Older tokens/API versions may reject this optional creative
+            # field; fall back ONLY for a genuine unsupported-field error.
+            detail = str(exc).lower()
+            unsupported = ('whats_app_business_phone_number' in detail and
+                           any(k in detail for k in ('unknown', 'nonexisting', 'does not exist',
+                                                     'cannot query', 'unsupported field')))
+            if not unsupported:
+                raise
+            ads = graph_read(api, config, f'act_{account_id}/ads', fallback_ad_fields, preferred)
     except Exception as exc:
         ads = []
         ad_inventory_complete = False
@@ -200,7 +227,12 @@ def collect_account(api, config, account, period, today=None, yesterday=None):
     }, ensure_ascii=False))
     resolved_ids = {}
     records = []
-    by_ad = {str(row.get('ad_id')): row for row in insights}
+    # Prefer the period actually requested; do not let a yesterday-only row
+    # overwrite today's actions when classifying an unlabelled creative.
+    by_ad = {ad_id: (by_period['selected'].get(ad_id)
+                     or by_period['today'].get(ad_id)
+                     or by_period['yesterday'].get(ad_id, {}))
+             for ad_id in {str(row.get('ad_id')) for row in insights}}
     for ad_id in sorted(set(by_ad) | set(admap)):
         ad = admap.get(ad_id, {})
         row = by_ad.get(ad_id, {})
@@ -232,12 +264,20 @@ def collect_account(api, config, account, period, today=None, yesterday=None):
         is_whatsapp = bool(numbers or phone_ids or 'WHATSAPP' in destination or 'WHATSAPP' in metadata_text)
         unknown_metadata = not adset or not ad.get('creative')
         reportable = is_whatsapp or (unknown_metadata and has_messages)
-        if not reportable and not active and float(by_period['today'].get(ad_id, {}).get('spend') or 0) <= 0:
+        # A non-WhatsApp ad can still spend, and that spend is part of the
+        # account-level total. Keep it in the reconciliation ledger, even if it
+        # is inactive now or its spend belongs to a selected historical range.
+        if (not reportable and not active and not any(
+            float(mapping.get(ad_id, {}).get('spend') or 0) > 0
+            for mapping in by_period.values()
+        )):
             continue
         mixed = bool(is_whatsapp and ('MESSENGER' in destination or 'INSTAGRAM' in destination or destination == 'MULTIPLE'))
         # An ad with multiple destinations cannot have its full spend assigned to each.
         number = next(iter(numbers)) if len(numbers) == 1 and not mixed and not any(not resolved_ids[i] for i in phone_ids) else ''
-        reason = ('multiple destinations' if mixed or len(numbers) > 1 else 'destination not returned by Meta') if not number else ''
+        reason = ('multiple destinations' if mixed or len(numbers) > 1 else
+                  'destination not returned by Meta' if reportable else
+                  'WhatsApp destination not verified') if not number else ''
         campaign_id = str(ad.get('campaign_id') or row.get('campaign_id') or adset.get('campaign_id') or '')
         currency = account.get('currency') or 'EGP'
         budget = None
@@ -255,15 +295,46 @@ def collect_account(api, config, account, period, today=None, yesterday=None):
         record = {'phone': number if reportable else '', 'reason': reason, 'currency': currency,
             'account_id': account_id, 'ad_id': ad_id,
             'buyer': account.get('buyer_code') or api.extract_buyer_code(account.get('name', '')),
-            'campaign_id': campaign_id, 'active': active, 'budget': budget,
+            'campaign_id': campaign_id, 'adset_id': adset_id,
+            'destination_type': destination, 'active': active, 'budget': budget,
             'budget_missing': budget_missing, 'lifetime': lifetime, 'budget_only': not reportable,
             'candidate_phones': numbers, 'budget_targets_incomplete': not ad_inventory_complete}
         for key, mapping in by_period.items():
-            metric = mapping.get(ad_id, {}) if reportable else {}
+            # Always retain the source Insights values: dropping the spend of
+            # ads with an unknown/non-WA destination made the visible total
+            # smaller than the media buyer's real account-level spend.
+            metric = mapping.get(ad_id, {})
             suffix = '' if key == 'selected' else '_' + key
             record['spend' + suffix] = float(metric.get('spend') or 0)
             record['messages' + suffix] = message_count(metric.get('actions'))
         records.append(record)
+
+    for mapping_name in ('selected', 'today'):
+        source_total = sum(float(x.get('spend') or 0) for x in by_period[mapping_name].values())
+        record_field = 'spend' if mapping_name == 'selected' else 'spend_today'
+        record_total = sum(float(x.get(record_field) or 0) for x in records)
+        if abs(source_total - record_total) > 0.011:
+            raise ValueError(f'{account_id}: {mapping_name} spend dropped between Insights '
+                             f'and phone records: {source_total:.2f} != {record_total:.2f}')
+
+    # Every budget owner must also appear in the reconciliation ledger, even
+    # if none of its ad creatives exposes a resolvable WhatsApp destination.
+    attached = {tuple(row['budget']['key']) for row in records if row.get('budget')}
+    for owner in list(live_owners.values()) + list(stopped_ads.values()):
+        if tuple(owner['key']) in attached:
+            continue
+        records.append({
+            'phone': '', 'reason': 'budget destination not returned by Meta',
+            'currency': account.get('currency') or 'EGP',
+            'account_id': account_id,
+            'ad_id': '__unassigned_owner__' + ':'.join(map(str, owner['key'])),
+            'buyer': account.get('buyer_code') or api.extract_buyer_code(account.get('name', '')),
+            'campaign_id': '', 'active': False, 'budget': owner,
+            'budget_missing': False, 'lifetime': False,
+            'budget_only': True, 'owner_only': True,
+            'candidate_phones': set(), 'budget_targets_incomplete': True,
+            **{key: 0.0 for key in METRICS},
+        })
     return records, issues
 
 
@@ -345,10 +416,61 @@ def aggregate_phone_budgets(records):
     return daily, shared
 
 
+def reconcile_phone_totals(records, exclusive, live_exclusive, shared):
+    """Full-scope audit; no cost or budget is invented for an unknown WA ID.
+
+    Phone allocations are only the provable exclusive part of each owner.
+    The remaining owner budgets MUST remain visible as a separate shared or
+    unattributed total instead of disappearing from the report.
+    """
+    summary = defaultdict(lambda: defaultdict(float))
+    seen_owners = set()
+    for row in records:
+        currency = row.get('currency') or 'EGP'
+        if not row.get('owner_only'):
+            today_spend = float(row.get('spend_today') or 0)
+            summary[currency]['all_spend_today'] += today_spend
+            if row.get('phone') and not row.get('budget_only'):
+                summary[currency]['assigned_spend_today'] += today_spend
+            elif row.get('budget_only'):
+                summary[currency]['other_unverified_spend_today'] += today_spend
+            else:
+                summary[currency]['wa_unattributed_spend_today'] += today_spend
+        owner = row.get('budget')
+        if owner:
+            owner_key = tuple(owner['key'])
+            if owner_key not in seen_owners:
+                seen_owners.add(owner_key)
+                summary[currency]['overall_daily_budget'] += float(owner['amount'])
+                if owner.get('mode') == 'live':
+                    summary[currency]['overall_live_budget'] += float(owner['amount'])
+    for (phone, currency), value in exclusive.items():
+        summary[currency]['assigned_daily_budget'] += value
+    for (phone, currency), value in live_exclusive.items():
+        summary[currency]['assigned_live_budget'] += value
+    for owner in shared:
+        currency = owner['currency']
+        summary[currency]['shared_daily_budget'] += float(owner['amount'])
+        if owner.get('mode') == 'live':
+            summary[currency]['shared_live_budget'] += float(owner['amount'])
+
+    for currency, values in summary.items():
+        if abs(values['overall_daily_budget'] - values['assigned_daily_budget'] - values['shared_daily_budget']) > 0.011:
+            raise ValueError(f'Daily budget attribution not reconciled for {currency}')
+        if abs(values['overall_live_budget'] - values['assigned_live_budget'] - values['shared_live_budget']) > 0.011:
+            raise ValueError(f'Live budget attribution not reconciled for {currency}')
+        unknown_sum = (values['assigned_spend_today'] + values['wa_unattributed_spend_today']
+                       + values['other_unverified_spend_today'])
+        if abs(values['all_spend_today'] - unknown_sum) > 0.011:
+            raise ValueError(f'Spend attribution not reconciled for {currency}')
+    return summary
+
+
 def render_phone_report(api, records, errors, period, today, yesterday, team_key, agent_code, phone_filter=''):
     unique = {(r['account_id'], r['ad_id']): r for r in records}
     records = list(unique.values())
     exclusive, live_exclusive, shared = aggregate_phone_budget_components(records)
+    reconciliation = reconcile_phone_totals(records, exclusive, live_exclusive, shared)
     groups = {}
     unknown = defaultdict(lambda: {k: 0.0 for k in METRICS})
     missing_budget = 0
@@ -402,11 +524,43 @@ def render_phone_report(api, records, errors, period, today, yesterday, team_key
             f'Live daily budget : {live_text}']
     if not groups:
         lines.append('No matching WA numbers found.')
+    if not phone_filter and (period.since, period.until) == (today.since, today.until):
+        # Leave the original per-number layout untouched, and reconcile the
+        # missing values explicitly beneath it. The two totals can be compared
+        # with the matching balance report at the SAME timestamp/date/scope.
+        incomplete_totals = bool(errors or missing_budget)
+        for currency, data in sorted(reconciliation.items()):
+            fmt = lambda key: f"{data[key]:,.2f} {currency}"
+            qualifier = ' (confirmed only)' if incomplete_totals else ''
+            lines += [
+                '', '──────────────',
+                '*WA Reconciliation (Today)*',
+                f"*Total Spend Today (all ads):* {fmt('all_spend_today')}{qualifier}",
+                f"Assigned to WA numbers: {fmt('assigned_spend_today')}",
+                f"WA destination unknown: {fmt('wa_unattributed_spend_today')}",
+                f"Other / unverified destination: {fmt('other_unverified_spend_today')}",
+                f"*Overall Daily Budget (all owners):* {fmt('overall_daily_budget')}{qualifier}",
+                f"*Overall Live Budget (all owners):* {fmt('overall_live_budget')}{qualifier}",
+                f"Budget assigned to WA numbers: {fmt('assigned_daily_budget')}",
+                f"Budget shared / unattributed: {fmt('shared_daily_budget')}",
+            ]
+            print('PHONE RECONCILIATION AUDIT: ' + json.dumps({
+                'currency': currency, **{k: round(v, 2) for k, v in data.items()}
+            }, ensure_ascii=False))
     # Diagnostics belong in GitHub logs, never in the WhatsApp report body.
     for item in shared:
         print('PHONE BUDGET DETAIL: ' + json.dumps(item, default=lambda v: sorted(v) if isinstance(v, set) else str(v), ensure_ascii=False))
     for currency, values in unknown.items():
         print('PHONE UNMAPPED DETAIL: ' + json.dumps({'currency': currency, **values}, ensure_ascii=False))
+    for row in records:
+        if not row.get('owner_only') and not row.get('phone') and float(row.get('spend_today') or 0) > 0:
+            print('PHONE UNMAPPED AD: ' + json.dumps({
+                'account_id': row.get('account_id'), 'ad_id': row.get('ad_id'),
+                'adset_id': row.get('adset_id'), 'campaign_id': row.get('campaign_id'),
+                'spend_today': round(float(row.get('spend_today') or 0), 2),
+                'destination_type': row.get('destination_type'),
+                'reason': row.get('reason'), 'possible_phones': sorted(row.get('candidate_phones') or []),
+            }, ensure_ascii=False))
     if missing_budget:
         print(f'PHONE BUDGET WARNING: {missing_budget} ads have unavailable budget metadata')
     return '\n'.join(lines)
