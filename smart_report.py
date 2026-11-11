@@ -44,6 +44,7 @@ from allocation_config import (
 )
 from allocation_meta import MetaClient as AllocationMetaClient
 from allocation_meta import fetch_full_snapshot
+from allocation_collection import collect_multi_token_snapshot
 
 
 BASE_URL = "https://graph.facebook.com"
@@ -2527,26 +2528,18 @@ def build_allocation_messages(
         key: AllocationMetaClient(access_token=token, api_version=config.api_version)
         for key, token in config.meta_tokens.items()
     }
-    primary_client = clients["token_1"]
     if team_key == "cairo":
         print(
             "Fetching current Cairo Allocation / Balance snapshot..."
         )
 
-        cairo_accounts = get_cairo_allocation_accounts(clients)
-
-        if cairo_accounts.empty:
-            raise RuntimeError(
-                "Cairo Allocation returned no eligible accounts."
-            )
-
-        cairo_snapshot, _details = fetch_full_snapshot(
-            primary_client,
-            cairo_accounts,
-            max_workers=config.max_workers,
-            spend_date=generated_at.date(),
-            clients_by_token_key=clients,
+        cairo_snapshot, _details, warnings = collect_multi_token_snapshot(
+            clients, [CAIRO_BUSINESS_ID], config.api_version,
+            generated_at.date(), config.max_workers,
+            include_me_accounts=False,
         )
+        for warning in warnings:
+            print(f"WARNING Cairo Allocation: {warning}")
 
         if cairo_snapshot.empty:
             raise RuntimeError(
@@ -2562,22 +2555,12 @@ def build_allocation_messages(
         )]
 
     print("Fetching current Taher Allocation / Balance snapshot...")
-    accounts = get_allocation_accounts_for_businesses(
-        clients, TAHER_BUSINESS_IDS, "Taher"
+    snapshot_df, _details, warnings = collect_multi_token_snapshot(
+        clients, TAHER_BUSINESS_IDS, config.api_version,
+        generated_at.date(), config.max_workers,
     )
-
-    if accounts.empty:
-        raise RuntimeError(
-            "Allocation Meta client returned no eligible accounts."
-        )
-
-    snapshot_df, _details = fetch_full_snapshot(
-        primary_client,
-        accounts,
-        max_workers=config.max_workers,
-        spend_date=generated_at.date(),
-        clients_by_token_key=clients,
-    )
+    for warning in warnings:
+        print(f"WARNING Taher Allocation: {warning}")
 
     if snapshot_df.empty:
         raise RuntimeError(
