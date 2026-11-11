@@ -593,6 +593,22 @@ def fetch_account_snapshot(client: MetaClient, account_row: pd.Series, spend_dat
         spend_today = adset_total_spend
         spend_source = "reconstructed_from_adset_insights"
 
+    # Account edges may omit archived/deleted parents. Only recover parents
+    # needed for an active child or an ad set that actually spent today.
+    known_campaigns = set(campaigns.get('id', pd.Series(dtype=str)).astype(str))
+    active_sets = {str(ad.get('adset_id') or '') for ad in ads if ad.get('effective_status') == 'ACTIVE'}
+    for adset in adsets.to_dict('records'):
+        sid, cid = str(adset['id']), str(adset.get('campaign_id') or '')
+        if cid in known_campaigns or (sid not in active_sets and _money_float(adset_spend_by_id.get(sid, 0)) == 0):
+            continue
+        if not cid:
+            raise MetaAPIError('Missing campaign_id for relevant ad set ' + sid)
+        parent = client._get(cid, {'fields': 'id,name,effective_status,daily_budget,lifetime_budget'})
+        if str(parent.get('id')) != cid:
+            raise MetaAPIError('Invalid campaign metadata for ' + cid)
+        campaigns = pd.concat([campaigns, pd.DataFrame([parent])], ignore_index=True)
+        known_campaigns.add(cid)
+
     daily_budget, campaign_daily_budget, adset_daily_budget, budget_details = calculate_account_daily_budget(
         campaigns,
         adsets,

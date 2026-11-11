@@ -19,6 +19,8 @@ def closing_budgets(campaigns, adsets, ads, campaign_spend, adset_spend, money):
     for adset in adsets:
         sid, cid = str(adset['id']), str(adset.get('campaign_id') or '')
         campaign = campaigns.get(cid)
+        if campaign is None and sid not in active_sets and float(adset_spend.get(sid, 0) or 0) == 0:
+            continue  # Unused historical orphan cannot contribute to today's closing total.
         if campaign is None:
             raise ValueError('Missing campaign metadata for budget calculation: ' + cid)
         if (money(campaign.get('daily_budget')) or 0) > 0 or (money(campaign.get('lifetime_budget')) or 0) > 0:

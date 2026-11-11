@@ -194,7 +194,11 @@ def fetch_account_with_fallback(account_id: str, candidates: list[tuple[str, dic
     errors: list[str] = []
     first_partial = None
     all_tokens = {label: client.access_token for label, client in clients.items()}
-    for label, row in candidates:
+    attempts = list(candidates)
+    known_labels = {label for label, _ in attempts}
+    if attempts:
+        attempts.extend((label, dict(attempts[0][1])) for label in clients if label not in known_labels)
+    for label, row in attempts:
         try:
             frame, details = fetch_full_snapshot(
                 clients[label], pd.DataFrame([row]), max_workers=1, spend_date=spend_date
@@ -207,7 +211,11 @@ def fetch_account_with_fallback(account_id: str, candidates: list[tuple[str, dic
                     first_partial = (frame, details, label)
                 errors.append(f"{label}: partial snapshot: {redact_meta_error(Exception(row_error), all_tokens)}")
                 continue
-            errors.append(f"{label}: account fetch_status=ERROR or no matching row")
+            raw_errors = frame['error'].dropna().astype(str).tolist() if 'error' in frame.columns else []
+            reason = '; '.join(raw_errors) or 'account fetch_status=ERROR or no matching row'
+            safe_reason = redact_meta_error(Exception(reason), all_tokens)
+            errors.append(f"{label}: {safe_reason}")
+            print(f"ALLOCATION FETCH ERROR act_{account_id} via {label}: {safe_reason}")
         except Exception as exc:
             errors.append(f"{label}: {redact_meta_error(exc, all_tokens)}")
     if first_partial is not None:
