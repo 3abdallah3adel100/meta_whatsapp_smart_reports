@@ -136,22 +136,68 @@ def collect_account(api, config, account, period, today=None, yesterday=None):
                 admap[ad_id] = graph_read(api, config, ad_id, ad_fields, preferred, False)
             except Exception:
                 admap[ad_id] = {'id': ad_id, 'adset_id': row.get('adset_id'), 'campaign_id': row.get('campaign_id')}
-    from budget_policy import closing_budgets
+    # Use the SAME audited calculation as Allocation.  The old
+    # closing_budgets() silently differed from the corrected budget policy.
+    from budget_policy import allocation_budget_breakdown
     campaign_spend, adset_spend = defaultdict(float), defaultdict(float)
-    for metric in by_period['today'].values():
+    today_rows = list(by_period['today'].values())
+    for metric in today_rows:
         campaign_spend[str(metric.get('campaign_id') or '')] += float(metric.get('spend') or 0)
         adset_spend[str(metric.get('adset_id') or '')] += float(metric.get('spend') or 0)
-    owners = {}
+        # A historical ad may be absent from /ads and its single-object lookup
+        # may also fail.  Under still-active parents, missing ad status cannot
+        # be interpreted as PAUSED: that would inflate stopped spend.
+        ad_id = str(metric.get('ad_id') or '')
+        ad = admap.get(ad_id, {})
+        cid = str(metric.get('campaign_id') or '')
+        sid = str(metric.get('adset_id') or '')
+        if (float(metric.get('spend') or 0) > 0
+                and not ad.get('effective_status')
+                and str(campaign_map.get(cid, {}).get('effective_status') or '') == 'ACTIVE'
+                and str(setmap.get(sid, {}).get('effective_status') or '') == 'ACTIVE'):
+            issues.append(f'{account_id}: status unavailable for spent ad {ad_id}')
+
+    live_owners = {}
+    stopped_ads = {}
     budget_inventory_complete = ad_inventory_complete and not issues
+    budget_details = []
     if budget_inventory_complete:
         try:
-            owners = closing_budgets(campaigns, adsets, list(admap.values()),
+            _live, _stopped, budget_details = allocation_budget_breakdown(
+                campaigns, adsets, list(admap.values()),
                 campaign_spend, adset_spend,
-                lambda value: api_money_to_major(value, account.get('currency') or 'EGP'))
-        except ValueError as exc:
+                lambda value: api_money_to_major(value, account.get('currency') or 'EGP'),
+                ad_spend_rows=today_rows,
+            )
+            for item in budget_details:
+                level, entity_id = item['budget_level'], str(item['entity_id'])
+                mode = item['calculation_mode']
+                owner = dict(
+                    amount=float(item['daily_budget']), mode=mode,
+                    label=item.get('entity_name') or entity_id,
+                    # Spent entries have a unique ad ID.  Live entries have a
+                    # unique CBO Campaign / ABO Ad Set ID.
+                    key=(account_id, mode, level, entity_id),
+                )
+                if mode == 'live':
+                    live_owners[(level, entity_id)] = owner
+                else:
+                    stopped_ads[entity_id] = owner
+        except (ValueError, TypeError, KeyError) as exc:
+            # Never present a partial or uncertain budget as an exact zero.
             budget_inventory_complete = False
-            issues.append(str(exc))
-    print('PHONE BUDGET CLOSING: ' + json.dumps({'account_id': account_id, 'owners': [{'level': k[0], 'id': k[1], **v} for k, v in owners.items()]}, ensure_ascii=False))
+            issues.append(f'{account_id}: budget reconciliation unavailable: {exc}')
+            budget_details = []
+            live_owners.clear()
+            stopped_ads.clear()
+
+    print('PHONE BUDGET CLOSING: ' + json.dumps({
+        'account_id': account_id,
+        'live': sum(v['amount'] for v in live_owners.values()),
+        'stopped': sum(v['amount'] for v in stopped_ads.values()),
+        'owners': budget_details,
+        'complete': budget_inventory_complete,
+    }, ensure_ascii=False))
     resolved_ids = {}
     records = []
     by_ad = {str(row.get('ad_id')): row for row in insights}
@@ -186,7 +232,7 @@ def collect_account(api, config, account, period, today=None, yesterday=None):
         is_whatsapp = bool(numbers or phone_ids or 'WHATSAPP' in destination or 'WHATSAPP' in metadata_text)
         unknown_metadata = not adset or not ad.get('creative')
         reportable = is_whatsapp or (unknown_metadata and has_messages)
-        if not reportable and not active:
+        if not reportable and not active and float(by_period['today'].get(ad_id, {}).get('spend') or 0) <= 0:
             continue
         mixed = bool(is_whatsapp and ('MESSENGER' in destination or 'INSTAGRAM' in destination or destination == 'MULTIPLE'))
         # An ad with multiple destinations cannot have its full spend assigned to each.
@@ -197,11 +243,13 @@ def collect_account(api, config, account, period, today=None, yesterday=None):
         budget = None
         budget_missing = False
         lifetime = False
-        owner_key = ('CBO', campaign_id) if ('CBO', campaign_id) in owners else ('ABO', adset_id)
-        owner = owners.get(owner_key)
-        if owner and ((owner['mode'] == 'live' and active) or
-                      (owner['mode'] == 'spent' and float(by_period['today'].get(ad_id, {}).get('spend') or 0) > 0)):
-            budget = {**owner, 'key': (account_id, *owner_key)}
+        campaign = campaign_map.get(campaign_id, {})
+        is_cbo = (api_money_to_major(campaign.get('daily_budget'), currency) or 0) > 0 or (
+            api_money_to_major(campaign.get('lifetime_budget'), currency) or 0) > 0
+        owner_key = ('CBO', campaign_id) if is_cbo else ('ABO', adset_id)
+        # A stopped ad inside a live owner has already consumed part of that
+        # owner's daily limit.  Never add its spend above the live budget.
+        budget = live_owners.get(owner_key) or stopped_ads.get(ad_id)
         budget_missing = not budget_inventory_complete
         lifetime = bool(adset.get('lifetime_budget') or campaign_map.get(campaign_id, {}).get('lifetime_budget'))
         record = {'phone': number if reportable else '', 'reason': reason, 'currency': currency,
@@ -260,8 +308,12 @@ def build_phone_report(api, config, period, team_key, agent_code, phone_filter='
 METRICS = ('spend', 'messages', 'spend_today', 'messages_today', 'spend_yesterday', 'messages_yesterday')
 
 
-def aggregate_phone_budgets(records):
-    """Each budget owner counts once, regardless of ads or number filters."""
+def aggregate_phone_budget_components(records):
+    """Allocate each unique owner once; distinguish today's closing vs live.
+
+    When multiple destinations share one CBO/ABO budget, or an ad destination
+    is unknown, do NOT pretend that the full budget belongs to either number.
+    """
     budgets = {}
     for row in records:
         budget = row.get('budget')
@@ -273,20 +325,30 @@ def aggregate_phone_budgets(records):
         if row.get('budget_targets_incomplete'):
             item['phones'].add('')
         item['candidates'].update(row.get('candidate_phones', set()))
-    exclusive = defaultdict(float)
+    daily = defaultdict(float)
+    live = defaultdict(float)
     shared = []
     for item in budgets.values():
         if len(item['phones']) == 1 and '' not in item['phones']:
-            exclusive[(next(iter(item['phones'])), item['currency'])] += item['amount']
+            key = (next(iter(item['phones'])), item['currency'])
+            daily[key] += item['amount']
+            if item.get('mode') == 'live':
+                live[key] += item['amount']
         else:
             shared.append(item)
-    return exclusive, shared
+    return daily, live, shared
+
+
+def aggregate_phone_budgets(records):
+    """Backward-compatible accessor for the existing closing budget total."""
+    daily, _live, shared = aggregate_phone_budget_components(records)
+    return daily, shared
 
 
 def render_phone_report(api, records, errors, period, today, yesterday, team_key, agent_code, phone_filter=''):
     unique = {(r['account_id'], r['ad_id']): r for r in records}
     records = list(unique.values())
-    exclusive, shared = aggregate_phone_budgets(records)
+    exclusive, live_exclusive, shared = aggregate_phone_budget_components(records)
     groups = {}
     unknown = defaultdict(lambda: {k: 0.0 for k in METRICS})
     missing_budget = 0
@@ -325,15 +387,19 @@ def render_phone_report(api, records, errors, period, today, yesterday, team_key
         lines.append('⚠️ Partial data')
     for (phone, currency), group in sorted(groups.items(), key=lambda kv: (-kv[1]['spend'], kv[0])):
         budget = exclusive[(phone, currency)]
+        live_budget = live_exclusive[(phone, currency)]
         shares = [b for b in shared if b['currency'] == currency and phone in (b['phones'] | b['candidates'])]
-        # Keep one budget line while avoiding presenting an incomplete amount as exact.
+        # Shared CBO/ABO budgets must not be repeated under multiple numbers.
         budget_text = f'{budget:,.2f} {currency}'
+        live_text = f'{live_budget:,.2f} {currency}'
         if shares or group['budget_missing']:
             budget_text = f'{budget:,.2f} {currency} (confirmed only)' if budget else 'N/A (shared or unavailable)'
+            live_text = f'{live_budget:,.2f} {currency} (confirmed only)' if live_budget else 'N/A (shared or unavailable)'
         lines += ['', f'WA Phonenumber : +{phone}',
             f"Spend ( {label} ) : {group['spend']:,.2f} {currency}",
             f"Messages : {group['messages']:,.0f}",
-            f'Daily budget : {budget_text}']
+            f'Daily budget : {budget_text}',
+            f'Live daily budget : {live_text}']
     if not groups:
         lines.append('No matching WA numbers found.')
     # Diagnostics belong in GitHub logs, never in the WhatsApp report body.
