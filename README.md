@@ -733,3 +733,13 @@ Today Cairo
 ```
 
 Taher keeps the existing agent-based reporting. Cairo/Qaoud is always Overall and does not split Spend/Age/Governorate/Allocation by agent. Cairo lead counting keeps the existing WP/LG Cairo-specific objective logic.
+
+
+## WhatsApp destination phone report
+
+New opt-in report type: `phones`. Supports full phone numbers, `suffix:5678`, existing agent/team/date filters, and Arabic/English commands.
+See [PHONE_REPORT_SETUP_AR.md](PHONE_REPORT_SETUP_AR.md) for deployment instructions, examples and attribution limits. Existing Full/Spend/Age/Governorate/Allocation calculations are unchanged.
+
+
+### Phone report daily comparison and current budget
+Every phone report now includes today/yesterday spend and conversations, plus current unique ABO/CBO daily budgets. A different requested date range is shown as an additional section. Shared budgets are listed separately and counted once in an overall total only when all targets are confirmed and selected. Lifetime budgets are not converted to daily budgets. See the Arabic setup guide for examples and scope.

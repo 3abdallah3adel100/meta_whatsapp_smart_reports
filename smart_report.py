@@ -71,6 +71,7 @@ REPORT_TYPE_ORDER = [
     "age",
     "governorate",
     "allocation",
+    "phones",
 ]
 
 
@@ -504,6 +505,9 @@ def parse_report_types(raw: str) -> list[str]:
         "regions": "governorate",
         "allocation": "allocation",
         "balance": "allocation",
+        "phones": "phones",
+        "phone": "phones",
+        "numbers": "phones",
     }
 
     out: list[str] = []
@@ -2700,6 +2704,7 @@ def build_requested_messages(
     agent_code: str,
     report_types: list[str],
     generated_at: datetime,
+    phone_filter: str = "",
 ) -> list[tuple[str, str]]:
     messages: list[tuple[str, str]] = []
 
@@ -2803,6 +2808,12 @@ def build_requested_messages(
             )
         )
 
+    if "phones" in report_types:
+        from phone_report import build_phone_report
+        messages.append(("WhatsApp Numbers", build_phone_report(
+            sys.modules[__name__], config, period, team_key, agent_code, phone_filter
+        )))
+
     return messages
 
 
@@ -2843,6 +2854,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
     )
 
+    parser.add_argument("--phone", default="")
     return parser.parse_args()
 
 
@@ -2920,6 +2932,7 @@ def main() -> int:
                 agent_code,
                 daily_report_types,
                 generated_at,
+                phone_filter=args.phone,
             )
             messages.extend(
                 (f"{label} {day_period.since}", body)
@@ -2943,6 +2956,7 @@ def main() -> int:
             agent_code,
             report_types,
             generated_at,
+            phone_filter=args.phone,
         )
 
     if not messages:

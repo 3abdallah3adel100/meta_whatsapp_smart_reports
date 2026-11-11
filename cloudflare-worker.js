@@ -260,6 +260,10 @@ const TEAMS = {
 };
 
 const REPORT_TYPES = {
+  phones: {
+    label: "WhatsApp Numbers / Spend / Messages",
+    aliases: ["phones", "phone", "numbers", "number", "mobile", "mobiles", "واتساب", "واتس اب", "واتس", "whatsapp", "نمبر", "النمبر", "whatsapp numbers", "ارقام", "الارقام", "رقم", "الرقم", "نمر", "النمر", "نمره", "نمرة", "موبايل", "الموبايل", "تليفون", "التليفون", "تلفون", "التلفون", "هاتف", "الهاتف"],
+  },
   spend: {
     label: "Spend / Performance",
     aliases: [
@@ -795,7 +799,7 @@ function findReportTypes(text) {
 
   const types = [];
 
-  for (const reportType of REPORT_ORDER) {
+  for (const reportType of [...REPORT_ORDER, "phones"]) {
     const config = REPORT_TYPES[reportType];
 
     const matched = config.aliases.some(
@@ -831,6 +835,22 @@ function isExplicitAllAgents(text) {
 }
 
 
+function parsePhoneSelection(input) {
+  const raw = translateDigits(input);
+  const normalized = normalizeText(raw);
+  const suffix = raw.match(/(?:اخره|آخره|اخرها|آخرها|بينتهي\s*(?:ب|بـ)?|ينتهي\s*(?:ب|بـ)?|ending\s*(?:in|with)?|ends?\s*with|suffix)\s*[:\-]?\s*(\d{3,8})(?!\d)/i);
+  if (suffix) return { filter: `suffix:${suffix[1]}`, text: raw.replace(suffix[0], " "), matched: true };
+  // Full numbers: contiguous, or grouped with separators. Dates cannot match.
+  const numberInput = raw.replace(/\b(?:\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4})\b/g, m => " ".repeat(m.length));
+  const full = [...numberInput.matchAll(/(?<![\d/])\+?(?:\d[ \-]?){8,14}\d(?![\d/])/g)]
+    .filter(m => m[0].replace(/\D/g, "").length >= 9);
+  if (full.length > 1) return { invalid: true };
+  if (full.length) return { filter: full[0][0].replace(/\D/g, ""), text: raw.replace(full[0][0], " "), matched: true };
+  const short = normalized.match(/(?:رقم|الرقم|number|phone)\s+(\d{3,8})(?!\d)/i);
+  if (short) return { filter: `suffix:${short[1]}`, text: normalized.replace(short[0], " "), matched: true };
+  return { filter: "", text: raw, matched: false };
+}
+
 function parseCommand(input) {
   const text = normalizeText(input);
 
@@ -838,8 +858,11 @@ function parseCommand(input) {
     return { type: "menu" };
   }
 
-  const customDate = parseCustomDateSelection(input);
-  const presetRange = firstRange(text);
+  const phoneSelection = parsePhoneSelection(input);
+  if (phoneSelection.invalid) return { type: "invalid", reason: "multiple_phone_numbers" };
+  const dateInput = phoneSelection.text;
+  const customDate = parseCustomDateSelection(dateInput);
+  const presetRange = firstRange(normalizeText(dateInput));
   const range = customDate.matched
     ? {
         key: customDate.rangeKey,
@@ -852,8 +875,15 @@ function parseCommand(input) {
         dailySplit: false,
       };
   const teams = findTeams(text);
-  const agents = findAgents(text);
+  let agents = findAgents(text);
   const reportSelection = findReportTypes(text);
+  if (phoneSelection.matched || reportSelection.types.includes("phones")) {
+    if (agents.includes("MM") && agents.includes("MA")) agents = agents.filter(a => a !== "MA");
+    if (!agents.length) {
+      const extraNames = { HM: ["هشام", "hisham", "hesham"], BM: ["شلاوي", "شلاوى", "shalawy", "sh3lawy"], AF: ["عمر", "عمر فتحي"] };
+      agents = Object.keys(extraNames).filter(code => extraNames[code].some(name => phrasePresent(text, name)));
+    }
+  }
   const explicitAll = isExplicitAllAgents(text);
 
   if (teams.length > 1) {
@@ -889,8 +919,14 @@ function parseCommand(input) {
   );
 
   let reportTypes = reportSelection.types;
+  const phoneIntent = phoneSelection.matched || reportTypes.includes("phones");
+  if (phoneIntent) {
+    // Spend/messages describe the phone report, rather than requesting a second general report.
+    reportTypes = [...new Set([...reportTypes.filter(t => t !== "spend"), "phones"])];
+  }
 
   const recognizedAnything = (
+    phoneIntent ||
     range.matched ||
     teams.length > 0 ||
     agents.length > 0 ||
@@ -932,6 +968,7 @@ function parseCommand(input) {
     reportLabels: reportTypes.map(
       (type) => REPORT_TYPES[type].label
     ),
+    phoneFilter: phoneSelection.filter,
     rawCommand: String(input || ""),
   };
 }
@@ -960,7 +997,13 @@ function menuText() {
     "• Age — Spend / Leads / CPL by Age",
     "• Government — Spend / Leads / CPL by Governorate",
     "• Allocation — Budget / Balance / Coverage",
-    "• Full — كل التقارير",
+    "• Phones — أرقام واتساب / الصرف / المحادثات",
+    "• Full — التقارير الأربعة الأصلية",
+    "• عايز الصرف وعدد الماسدجات لارقام التليفون",
+    "• ارقام عبدالله امبارح",
+    "• صرف الرقم 01012345678 اخر 7 ايام",
+    "• الرقم اللي اخره 5678 الشهر ده",
+    "• Phones Cairo today",
     "",
     "👤 *Taher Agents*",
     "AA — Abdallah Adel",
@@ -1045,6 +1088,8 @@ function reportSummary(command) {
   lines.push(
     `📑 ${command.reportLabels.join(" + ")}`
   );
+
+  if (command.phoneFilter) lines.push(`📱 ${command.phoneFilter.replace("suffix:", "آخر أرقام: ")}`);
 
   if (command.dailySplit) {
     lines.push("🗓️ كل يوم هيتبعت كتقرير منفصل.");
@@ -1134,6 +1179,7 @@ async function dispatchGitHub(env, command, sender) {
         report_types: command.reportTypes.join(","),
         recipient: normalizePhone(sender),
         raw_command: command.rawCommand.slice(0, 500),
+        phone_filter: command.phoneFilter || "",
       },
     }),
   });
