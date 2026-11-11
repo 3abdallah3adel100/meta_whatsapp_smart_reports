@@ -102,17 +102,10 @@ def discover_all_accounts(clients: dict[str, MetaClient], business_ids: list[str
             per_token[token_label] = value
 
     for label, client in clients.items():
-        # Keep the old MetaClient's discovery and its special account metadata.
-        try:
-            baseline = client.get_ad_accounts()
-            if not baseline.empty:
-                for row in baseline.to_dict("records"):
-                    if suitable_baseline_account(row, business_ids) and (include_me_accounts or str(row.get("source") or "").startswith("business/")):
-                        add(row, label, str(row.get("source") or "me/adaccounts"))
-            for issue in getattr(client, "discovery_errors", []) or []:
-                warnings.append(f"{label}: {redact_meta_error(Exception(issue), all_tokens)}")
-        except Exception as exc:
-            warnings.append(f"{label}: built-in discovery failed: {redact_meta_error(exc, all_tokens)}")
+        # Do not call get_ad_accounts() here: it re-queries these same
+        # business edges (plus /me) and doubles discovery work. The explicit
+        # queries below cover the selected businesses and preserve full
+        # account metadata, including balances.
 
         # Explicitly query ALL selected businesses with EACH available token.
         # This ensures a new business is included even if config.py is unchanged.
@@ -151,8 +144,17 @@ def discover_all_accounts(clients: dict[str, MetaClient], business_ids: list[str
         # Preserve the existing name-coded accounts that the token can access
         # outside the configured businesses. Do not include unrelated names.
         try:
-            rows = graph_accounts(client.access_token, api_version, "me/adaccounts",
-                                  "id,account_id,name,account_status,currency", client=client)
+            try:
+                rows = graph_accounts(client.access_token, api_version, "me/adaccounts",
+                                      META_ACCOUNT_FIELDS, client=client)
+            except RuntimeError as exc:
+                # Only retry with basic fields for a field/permission issue,
+                # not when Meta is already limiting this token.
+                detail = str(exc).lower()
+                if any(x in detail for x in ("code=17", "code=4", "code=32", "code=613", "rate limit", "request limit")):
+                    raise
+                rows = graph_accounts(client.access_token, api_version, "me/adaccounts",
+                                      "id,account_id,name,account_status,currency", client=client)
             for row in rows:
                 name = str(row.get("name") or "").upper()
                 if any(prefix in name for prefix in ACCOUNT_NAME_PREFIXES):
@@ -233,7 +235,7 @@ def collect_multi_token_snapshot(clients: dict[str, MetaClient], business_ids: l
     details: list[dict] = []
     failed: list[str] = []
     token_counts: Counter = Counter()
-    with ThreadPoolExecutor(max_workers=max(1, min(int(max_workers), 3))) as executor:
+    with ThreadPoolExecutor(max_workers=max(1, min(int(max_workers), 6))) as executor:
         futures = {executor.submit(fetch_account_with_fallback, account_id, candidates,
                                    clients, spend_date): account_id
                    for account_id, candidates in discovered.items()}
