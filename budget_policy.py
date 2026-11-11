@@ -44,8 +44,10 @@ def allocation_budget_breakdown(campaigns, adsets, ads, campaign_spend,
     A daily-budget *owner* is a CBO campaign or an ABO adset, never both.
     Budget figures are taken once per owner. Stopped spend comes from unique
     ad-level Insights rows; a stopped ad may be inside a still-running owner.
-    Summing ad spend once avoids adding campaign + adset + ad spend for the
-    same stopped delivery.
+    A stopped ad's spend is added only when its budget owner is not live.
+    A live ABO ad set already contains spend of paused ads inside that ad set.
+    Likewise, a live CBO campaign already contains spend of paused ads/ad sets
+    inside that campaign. Only stopped budget owners contribute spent money.
 
     `ad_spend_rows=None` exists only for old clients/tests without ad insights:
     in that compatibility path only entirely stopped owners can be reconciled.
@@ -133,19 +135,26 @@ def allocation_budget_breakdown(campaigns, adsets, ads, campaign_spend,
             # active, status is ambiguous and we must NOT guess it was stopped.
             if ad is None and active(campaign) and active(group):
                 raise ValueError(f'Missing status for spent ad {aid} under active parents')
-            is_live = bool(ad and active(ad) and active(campaign) and active(group))
-            if is_live:
-                continue
             level = 'CBO' if parent_owns_budget(campaign) else 'ABO'
+            owner_id = cid if level == 'CBO' else sid
+            # Do not add spend from stopped ads inside a *live* budget owner:
+            # its daily budget already covers the entire owner, including any
+            # paused ads/adsets that consumed some of the budget today.
+            if (level, owner_id) in counted_budget_ids:
+                continue
+            # Active delivery under a non-daily (e.g. lifetime-funded) owner
+            # is not stopped spend either.
+            if ad and active(ad) and active(campaign) and active(group):
+                continue
             details.append(dict(budget_level=level, entity_id=aid,
                                 daily_budget=spent, calculation_mode='spent',
                                 entity_name=f'Stopped ad {aid}',
                                 campaign_id=cid, adset_id=sid))
     else:
         # Compatibility for fake legacy clients without per-ad Insights.
-        # This cannot split stopped ads inside an active budget owner.
+        # Only entirely inactive budget owners need stopped spend.
         for cid, campaign in campaigns.items():
-            if not parent_owns_budget(campaign) or cid in live_campaigns:
+            if not parent_owns_budget(campaign) or ('CBO', cid) in counted_budget_ids:
                 continue
             spent = amount(campaign_spend.get(cid))
             if spent:
@@ -159,7 +168,7 @@ def allocation_budget_breakdown(campaigns, adsets, ads, campaign_spend,
                 if amount(adset_spend.get(sid)):
                     raise ValueError(f'Missing campaign metadata for spent adset: {sid}')
                 continue
-            if parent_owns_budget(campaign) or sid in live_adsets:
+            if parent_owns_budget(campaign) or ('ABO', sid) in counted_budget_ids:
                 continue
             spent = amount(adset_spend.get(sid))
             if spent:
