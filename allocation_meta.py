@@ -618,6 +618,15 @@ def fetch_account_snapshot(client: MetaClient, account_row: pd.Series, spend_dat
         ads,
     )
 
+    # Live budget is ONLY the current effective budget of running owners.
+    # "spent" owners are intentionally kept in active_daily_budget (closing
+    # total), but excluded from the new Overall Live Budget metric.
+    live_daily_budget = sum(
+        _money_float(item.get("daily_budget"))
+        for item in budget_details
+        if item.get("calculation_mode") == "live"
+    )
+
     # A positive account spend with no spend found at campaign/adset level is
     # suspicious. Surface it explicitly instead of pretending the budget is zero.
     if spend_today > 0 and not budget_details:
@@ -656,7 +665,8 @@ def fetch_account_snapshot(client: MetaClient, account_row: pd.Series, spend_dat
         "timezone_offset_hours_utc": account_row.get("timezone_offset_hours_utc"),
         "campaign_daily_budget": campaign_daily_budget,
         "adset_daily_budget": adset_daily_budget,
-        "active_daily_budget": daily_budget,  # kept for report compatibility
+        "active_daily_budget": daily_budget,  # closing budget: live + stopped spend
+        "live_daily_budget": live_daily_budget,  # running budgets only
         "balance": balance,
         "balance_source": balance_source,
         "coverage_days": coverage_days,
@@ -743,6 +753,7 @@ def fetch_full_snapshot(
                     "campaign_daily_budget": 0.0,
                     "adset_daily_budget": 0.0,
                     "active_daily_budget": 0.0,
+                    "live_daily_budget": 0.0,
                     "balance": None,
                     "balance_source": "unavailable",
                     "coverage_days": None,

@@ -1986,6 +1986,17 @@ def filter_snapshot_agent(
     ].copy()
 
 
+def sum_live_daily_budget(snapshot_df: pd.DataFrame) -> float:
+    """Sum current running budgets only, excluding stopped entities' spend."""
+    if snapshot_df.empty or "live_daily_budget" not in snapshot_df.columns:
+        return 0.0
+    return float(
+        pd.to_numeric(snapshot_df["live_daily_budget"], errors="coerce")
+        .fillna(0)
+        .sum()
+    )
+
+
 def build_allocation_overall(
     snapshot_df: pd.DataFrame,
     generated_at: datetime,
@@ -2022,6 +2033,8 @@ def build_allocation_overall(
         else 0.0
     )
 
+    total_live = sum_live_daily_budget(snapshot_df)
+
     spend_vs_allocation = safe_ratio_pct(
         total_spend,
         allocation,
@@ -2040,6 +2053,7 @@ def build_allocation_overall(
         "",
         f"Spend Today: *{money(total_spend)}*",
         f"Daily Budget: *{money(total_daily)}*",
+        f"Overall Live Budget: *{money(total_live)}*",
         (
             f"Allocation Budget: *{money(allocation)}*"
             if allocation > 0
@@ -2153,6 +2167,7 @@ def build_allocation_agent_balance(
             "and a daily budget were found.",
             "",
             f"Overall Daily Budget: {money(0)}",
+            f"Overall Live Budget: {money(0)}",
             f"Overall Balance: {money(0)}",
         ])
     else:
@@ -2210,6 +2225,7 @@ def build_allocation_agent_balance(
             .fillna(0)
             .sum()
         )
+        overall_live_budget = sum_live_daily_budget(df)
         overall_balance = (
             pd.to_numeric(
                 df["balance"],
@@ -2222,6 +2238,7 @@ def build_allocation_agent_balance(
         lines.extend([
             "──────────────",
             f"*Overall Daily Budget:* {money(overall_budget)}",
+            f"*Overall Live Budget:* {money(overall_live_budget)}",
             f"*Overall Balance:* {money(overall_balance)}",
         ])
 
@@ -2433,6 +2450,8 @@ def build_cairo_allocation_report(
         else 0.0
     )
 
+    total_live = sum_live_daily_budget(snapshot_df)
+
     spend_vs_allocation = safe_ratio_pct(
         total_spend,
         allocation,
@@ -2451,6 +2470,7 @@ def build_cairo_allocation_report(
         "",
         f"Spend Today: *{money(total_spend)}*",
         f"Daily Budget: *{money(total_daily)}*",
+        f"Overall Live Budget: *{money(total_live)}*",
         f"Overall Balance: *{money(total_balance)}*",
         (
             f"Allocation Budget: *{money(allocation)}*"
