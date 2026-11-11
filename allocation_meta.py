@@ -468,61 +468,18 @@ def _entity_spend_map(
     return spend_map, errors
 
 
-def calculate_account_daily_budget(
-    campaigns: pd.DataFrame,
-    adsets: pd.DataFrame,
-    campaign_spend_by_id: dict[str, float],
-    adset_spend_by_id: dict[str, float],
-    currency: str,
-) -> tuple[float, float, float, list[dict]]:
-    """Mirror the Apps Script: campaign budgets and ad-set budgets are independent.
-
-    A budget counts only when ALL are true:
-      - effective_status == ACTIVE
-      - daily_budget exists and > 0
-      - that Campaign/Ad Set itself has Spend Today > 0
-    """
-    campaign_total = 0.0
-    adset_total = 0.0
-    details: list[dict] = []
-
-    if not campaigns.empty:
-        for _, campaign in campaigns.iterrows():
-            campaign_id = str(campaign.get("id") or "")
-            status = str(campaign.get("effective_status") or "").strip().upper()
-            daily_budget = api_money_to_major(campaign.get("daily_budget"), currency) or 0.0
-            spend_today = _money_float(campaign_spend_by_id.get(campaign_id, 0.0))
-            if status != "ACTIVE" or daily_budget <= 0 or spend_today <= 0:
-                continue
-            campaign_total += daily_budget
-            details.append({
-                "budget_level": "Campaign",
-                "campaign_id": campaign_id,
-                "campaign_name": str(campaign.get("name") or campaign_id),
-                "effective_status": status,
-                "spend_today": spend_today,
-                "daily_budget": daily_budget,
-            })
-
-    if not adsets.empty:
-        for _, adset in adsets.iterrows():
-            adset_id = str(adset.get("id") or "")
-            status = str(adset.get("effective_status") or "").strip().upper()
-            daily_budget = api_money_to_major(adset.get("daily_budget"), currency) or 0.0
-            spend_today = _money_float(adset_spend_by_id.get(adset_id, 0.0))
-            if status != "ACTIVE" or daily_budget <= 0 or spend_today <= 0:
-                continue
-            adset_total += daily_budget
-            details.append({
-                "budget_level": "Ad Set",
-                "campaign_id": str(adset.get("campaign_id") or ""),
-                "adset_id": adset_id,
-                "adset_name": str(adset.get("name") or adset_id),
-                "effective_status": status,
-                "spend_today": spend_today,
-                "daily_budget": daily_budget,
-            })
-
+def calculate_account_daily_budget(campaigns, adsets, campaign_spend_by_id,
+                                   adset_spend_by_id, currency, ads):
+    from budget_policy import closing_budgets
+    owners = closing_budgets(campaigns.to_dict('records'), adsets.to_dict('records'), ads,
+        campaign_spend_by_id, adset_spend_by_id,
+        lambda value: api_money_to_major(value, currency))
+    details = [dict(budget_level=kind, entity_id=entity_id, daily_budget=item['amount'],
+                    calculation_mode=item['mode'], entity_name=item['label'])
+               for (kind, entity_id), item in owners.items()]
+    print('BUDGET CLOSING: ' + json.dumps(details, ensure_ascii=False))
+    campaign_total = sum(x['amount'] for (kind, _), x in owners.items() if kind == 'CBO')
+    adset_total = sum(x['amount'] for (kind, _), x in owners.items() if kind == 'ABO')
     return campaign_total + adset_total, campaign_total, adset_total, details
 
 
@@ -535,37 +492,13 @@ def fetch_account_snapshot(client: MetaClient, account_row: pd.Series, spend_dat
 
     diagnostic_errors: list[dict] = []
     warnings: list[str] = []
-
-    # IMPORTANT: no account-spend gate here.
-    # This intentionally mirrors the working Google Sheets script: budgets are
-    # fetched and checked independently even if the account-level spend call is empty.
-    try:
-        campaigns, campaign_fetch_warnings = client.get_active_campaigns(account_id)
-        warnings.extend(campaign_fetch_warnings)
-        campaign_fetch_status = "OK"
-    except Exception as exc:
-        campaigns = pd.DataFrame()
-        campaign_fetch_status = "ERROR"
-        diagnostic_errors.append({
-            "entity_type": "campaign_fetch",
-            "entity_id": account_id,
-            "entity_name": account_name,
-            "error": str(exc),
-        })
-
-    try:
-        adsets, adset_fetch_warnings = client.get_active_adsets(account_id)
-        warnings.extend(adset_fetch_warnings)
-        adset_fetch_status = "OK"
-    except Exception as exc:
-        adsets = pd.DataFrame()
-        adset_fetch_status = "ERROR"
-        diagnostic_errors.append({
-            "entity_type": "adset_fetch",
-            "entity_id": account_id,
-            "entity_name": account_name,
-            "error": str(exc),
-        })
+    campaigns = pd.DataFrame(client.fetch_all_pages(f'act_{account_id}/campaigns',
+        {'fields': 'id,name,effective_status,daily_budget,lifetime_budget', 'limit': 500}))
+    adsets = pd.DataFrame(client.fetch_all_pages(f'act_{account_id}/adsets',
+        {'fields': 'id,name,campaign_id,effective_status,daily_budget,lifetime_budget', 'limit': 500}))
+    ads = client.fetch_all_pages(f'act_{account_id}/ads',
+        {'fields': 'id,campaign_id,adset_id,effective_status', 'limit': 500})
+    campaign_fetch_status = adset_fetch_status = 'OK'
 
     # 1) Account spend using the exact Apps Script date syntax first.
     spend_today, spend_source, spend_error = client.get_today_spend_with_diagnostics(
@@ -666,6 +599,7 @@ def fetch_account_snapshot(client: MetaClient, account_row: pd.Series, spend_dat
         campaign_spend_by_id,
         adset_spend_by_id,
         currency,
+        ads,
     )
 
     # A positive account spend with no spend found at campaign/adset level is

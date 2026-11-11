@@ -136,6 +136,22 @@ def collect_account(api, config, account, period, today=None, yesterday=None):
                 admap[ad_id] = graph_read(api, config, ad_id, ad_fields, preferred, False)
             except Exception:
                 admap[ad_id] = {'id': ad_id, 'adset_id': row.get('adset_id'), 'campaign_id': row.get('campaign_id')}
+    from budget_policy import closing_budgets
+    campaign_spend, adset_spend = defaultdict(float), defaultdict(float)
+    for metric in by_period['today'].values():
+        campaign_spend[str(metric.get('campaign_id') or '')] += float(metric.get('spend') or 0)
+        adset_spend[str(metric.get('adset_id') or '')] += float(metric.get('spend') or 0)
+    owners = {}
+    budget_inventory_complete = ad_inventory_complete and not issues
+    if budget_inventory_complete:
+        try:
+            owners = closing_budgets(campaigns, adsets, list(admap.values()),
+                campaign_spend, adset_spend,
+                lambda value: api_money_to_major(value, account.get('currency') or 'EGP'))
+        except ValueError as exc:
+            budget_inventory_complete = False
+            issues.append(str(exc))
+    print('PHONE BUDGET CLOSING: ' + json.dumps({'account_id': account_id, 'owners': [{'level': k[0], 'id': k[1], **v} for k, v in owners.items()]}, ensure_ascii=False))
     resolved_ids = {}
     records = []
     by_ad = {str(row.get('ad_id')): row for row in insights}
@@ -181,34 +197,13 @@ def collect_account(api, config, account, period, today=None, yesterday=None):
         budget = None
         budget_missing = False
         lifetime = False
-        if active:
-            campaign = campaign_map.get(campaign_id)
-            if campaign is None and campaign_id:
-                try:
-                    campaign = graph_read(api, config, campaign_id,
-                        'id,name,effective_status,daily_budget,lifetime_budget', preferred, False)
-                except Exception:
-                    campaign = {}
-                campaign_map[campaign_id] = campaign
-            campaign = campaign or {}
-            if not campaign or not adset:
-                budget_missing = True
-            elif campaign.get('effective_status') == 'ACTIVE' and adset.get('effective_status') == 'ACTIVE':
-                campaign_daily = api_money_to_major(campaign.get('daily_budget'), currency) or 0.0
-                campaign_lifetime = api_money_to_major(campaign.get('lifetime_budget'), currency) or 0.0
-                adset_daily = api_money_to_major(adset.get('daily_budget'), currency) or 0.0
-                if campaign_daily > 0:
-                    budget = {'key': (account_id, 'CBO', campaign_id), 'amount': campaign_daily,
-                              'label': campaign.get('name') or campaign_id}
-                elif campaign_lifetime > 0:
-                    lifetime = True
-                elif adset_daily > 0:
-                    budget = {'key': (account_id, 'ABO', adset_id), 'amount': adset_daily,
-                              'label': adset_id}
-                elif (api_money_to_major(adset.get('lifetime_budget'), currency) or 0) > 0:
-                    lifetime = True
-            elif not campaign.get('effective_status') or not adset.get('effective_status'):
-                budget_missing = True
+        owner_key = ('CBO', campaign_id) if ('CBO', campaign_id) in owners else ('ABO', adset_id)
+        owner = owners.get(owner_key)
+        if owner and ((owner['mode'] == 'live' and active) or
+                      (owner['mode'] == 'spent' and float(by_period['today'].get(ad_id, {}).get('spend') or 0) > 0)):
+            budget = {**owner, 'key': (account_id, *owner_key)}
+        budget_missing = not budget_inventory_complete
+        lifetime = bool(adset.get('lifetime_budget') or campaign_map.get(campaign_id, {}).get('lifetime_budget'))
         record = {'phone': number if reportable else '', 'reason': reason, 'currency': currency,
             'account_id': account_id, 'ad_id': ad_id,
             'buyer': account.get('buyer_code') or api.extract_buyer_code(account.get('name', '')),
@@ -270,7 +265,7 @@ def aggregate_phone_budgets(records):
     budgets = {}
     for row in records:
         budget = row.get('budget')
-        if not budget or not row['active']:
+        if not budget:
             continue
         key = tuple(budget['key'])
         item = budgets.setdefault(key, {**budget, 'currency': row['currency'], 'phones': set(), 'candidates': set()})
